@@ -41,7 +41,7 @@ block gameBlock:
     game{"runnable"}{"run"}[0].getStr() == "/bin/walker-waterworld")
   check("source_url points at the public repo",
     game{"runnable"}{"source_url"}.getStr().startsWith(
-      "https://github.com/Metta-AI/cogame-walker-waterworld"))
+      "https://github.com/softmax-universe/cogame-walker-waterworld"))
 
 block secretNamespaceEqualsGameName:
   ## The namespace must equal game.name EXACTLY: upload 400s otherwise and

@@ -17,7 +17,7 @@
       "image": "{{WALKER_WATERWORLD_IMAGE}}",
       "run": ["/bin/walker-waterworld"],
       "env": {},
-      "source_url": "https://github.com/Metta-AI/cogame-walker-waterworld/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-walker-waterworld/tree/main"
     },
     "replay_viewer": {
       "bundle": "static-replay-viewer"
@@ -210,7 +210,7 @@
       "image": "{{WALKER_WATERWORLD_IMAGE}}",
       "run": ["/bin/walker-waterworld-player"],
       "env": {"PLAYER_SCRIPTED": "shoal"},
-      "source_url": "https://github.com/Metta-AI/cogame-walker-waterworld/tree/main",
+      "source_url": "https://github.com/softmax-universe/cogame-walker-waterworld/tree/main",
       "resources": {
         "requests": {"cpu": "100m", "memory": "64Mi"},
         "limits": {"cpu": "1"}
