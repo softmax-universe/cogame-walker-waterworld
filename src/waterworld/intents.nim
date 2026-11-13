@@ -112,45 +112,43 @@ proc parseMode*(text: string, fallback: Mode): Mode =
   fallback
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## The outermost balanced `{...}` in a model reply, tolerating markdown fences
-  ## and any prose the model prefixed or suffixed. Falls back to
-  ## first-brace..last-brace when the scan finds no balanced pair, which is what
-  ## recovers a reply whose braces sit inside a quoted string.
-  var
-    depth = 0
-    start = -1
-    inString = false
-    escaped = false
-  for i, ch in text:
-    if inString:
-      if escaped: escaped = false
-      elif ch == '\\': escaped = true
-      elif ch == '"': inString = false
+  ## The first valid balanced `{...}` JSON object in a model reply, tracking
+  ## strings and escapes inside each `{...}` candidate so markdown fences,
+  ## stray quotes, or extra `{...}` fragments in surrounding prose cannot
+  ## corrupt extraction.
+  for start in 0 ..< text.len:
+    if text[start] != '{':
       continue
-    case ch
-    of '"': inString = true
-    of '{':
-      if depth == 0: start = i
-      inc depth
-    of '}':
-      if depth > 0:
+    var
+      depth = 0
+      inString = false
+      escaped = false
+    for i in start ..< text.len:
+      let ch = text[i]
+      if inString:
+        if escaped: escaped = false
+        elif ch == '\\': escaped = true
+        elif ch == '"': inString = false
+        continue
+      case ch
+      of '"': inString = true
+      of '{': inc depth
+      of '}':
         dec depth
-        if depth == 0 and start >= 0:
+        if depth == 0:
           try:
-            return parseJson(text[start .. i])
+            let node = parseJson(text[start .. i])
+            if node.kind == JObject:
+              return node
           except CatchableError:
-            start = -1
-    else: discard
-  let
-    first = text.find('{')
-    last = text.rfind('}')
-  if first < 0 or last <= first:
-    var head = text.strip()
-    if head.runeLen > 160:
-      head = head.truncateRunes(160) & "..."
-    raise newException(IntentError,
-      "no JSON object in reply: " & head.replace("\n", " "))
-  parseJson(text[first .. last])
+            discard
+          break
+      else: discard
+  var head = text.strip()
+  if head.runeLen > 160:
+    head = head.truncateRunes(160) & "..."
+  raise newException(IntentError,
+    "no JSON object in reply: " & head.replace("\n", " "))
 
 proc readNumber(node: JsonNode): tuple[ok: bool, value: float] =
   ## One numeric field: an int, a float, or a numeric string. Non-finite or
