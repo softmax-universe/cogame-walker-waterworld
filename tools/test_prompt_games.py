@@ -60,13 +60,14 @@ def play(binary: Path, variant: str, wording: str, prompt_seed: int, seed: int) 
             system, user = [m["content"] for m in observation["messages"]]
             assert f"{view['pod']['target']} catches" in system
             assert view.pop("prompt_template") == {
-                "bank": "walker-waterworld-rules-v2",
+                "bank": "walker-waterworld-rules-v3",
                 "selection": wording,
                 "variant": WORDINGS[prompt_seed % 5] if wording == "mixed" else wording,
                 "seed": prompt_seed,
                 "system_sha256": hashlib.sha256(system.encode()).hexdigest(),
                 "user_sha256": hashlib.sha256(user.encode()).hexdigest(),
             }
+            assert "//" not in system and 'never omit "partner"' in system
             seat = observation["seat"]
             if seat not in systems:
                 systems[seat] = system
@@ -157,7 +158,7 @@ def main() -> None:
         manifest = json.loads((destination / "manifest.json").read_text())
         assert len(manifest["runs"]) == 10
         assert all(
-            run["prompt_configuration"]["bank"] == "walker-waterworld-rules-v2"
+            run["prompt_configuration"]["bank"] == "walker-waterworld-rules-v3"
             for run in manifest["runs"]
         )
         families = {}

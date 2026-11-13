@@ -29,6 +29,23 @@ block fenced:
   check("fenced JSON parses", intent.mode == mEscort)
   check("the partner alias resolves", intent.partner == 2, $intent.partner)
 
+block balancedBracesAndProse:
+  let withBracesAndTrailing = parse(
+    """{"note":"avoid {rock} and \"}\"","mode":"hunt","target":"F3","partner":"none"} trailing {junk}""")
+  check("braces inside quoted note + trailing {junk} parse cleanly",
+    withBracesAndTrailing.mode == mHunt and withBracesAndTrailing.target == 2 and
+      withBracesAndTrailing.partner == -1)
+  check("quoted braces inside note survive intact",
+    withBracesAndTrailing.note == """avoid {rock} and "}"""")
+  let strayLeadQuote = parse(
+    """2" sensor margin: {"mode":"hold","partner":"none","throttle":0.0} {extra}""")
+  check("an unmatched quote in leading prose does not corrupt brace scanning",
+    strayLeadQuote.mode == mHold and strayLeadQuote.throttle255 == 0)
+  let leadingProseBraces = parse(
+    """Draft {idea "A}: {"mode":"escort","partner":"SKIM-4","target":"none"}""")
+  check("non-JSON {prose} braces before the reply object are skipped",
+    leadingProseBraces.mode == mEscort and leadingProseBraces.partner == 3)
+
 block percentageThrottle:
   let intent = parse("""{"mode":"sweep","throttle":70}""")
   check("an integer percentage throttle is divided by 100",

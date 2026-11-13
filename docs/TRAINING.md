@@ -23,7 +23,7 @@ view for an Observatory consumer and a numeric encoding for training.
 
 ## Prompt diversity
 
-The walker-waterworld-rules-v2 bank has five training briefings (canonical,
+The walker-waterworld-rules-v3 bank has five training briefings (canonical,
 plain, numbered, questions, reordered) and two evaluation-only briefings
 (heldout-briefing, heldout-reference). They vary the explanation and ordering of
 the setting, rewards, sensing, communication and control loop. The JSON action

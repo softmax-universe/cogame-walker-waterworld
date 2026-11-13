@@ -238,28 +238,14 @@ backs off poison for you. You choose WHAT to go for and HOW hard.
 const OutputFormat = """
 Reply with a single JSON object and NOTHING else. Your reply MUST begin with '{'.
 Schema:
-{"note":"<=160 chars, your reasoning",
- "mode":"hunt"|"escort"|"sweep"|"hold"|"avoid",
-   // hunt   : drive at the plankton named in "target" (or, if you cannot
-   //          sense it, the nearest plankton you CAN sense; if none, the
-   //          waypoint), aiming where it will be in lead_ticks
-   // escort : drive to the skimmer named in "partner", stopping 0.80 m short
-   //          of it - unless you sense plankton within 1.50 m of that partner,
-   //          in which case you go to the plankton instead. THIS is how two
-   //          skimmers arrive together.
-   // sweep  : drive to "waypoint" and hold there. Searching.
-   // hold   : brake to a stop where you are. Waiting on a partner.
-   // avoid  : run away from the nearest poison you sense (to the tank centre
-   //          if you sense none)
- "target":"F1".."F5" or "none",     // a plankton id you have sensed
- "partner":"SKIM-1".."SKIM-4" or "none",
- "waypoint":[x,y],                  // metres, clamped into the tank
- "lead_ticks":0..24,                // aim where the target will be this many
-                                    // ticks from now (24 ticks = 1 second)
- "standoff_m":0.0..2.5,             // how wide the autopilot swings around
-                                    // poison. 0 = ignore it, 2.5 = paranoid
- "throttle":0.0..1.0,               // fraction of full speed you ask for
- "say":"<=48 chars"}                // spectators only; no skimmer ever sees it
+{"note":"<=160 chars","mode":"hunt"|"escort"|"sweep"|"hold"|"avoid","target":"F1".."F5"|"none","partner":"SKIM-1".."SKIM-4"|"none","waypoint":[x,y],"lead_ticks":0..24,"standoff_m":0.0..2.5,"throttle":0.0..1.0,"say":"<=48 chars"}
+- Include ALL 9 keys every turn (set "target":"none" or "partner":"none" when unused; never omit "partner"; use "" for "note" or "say" when empty).
+- mode: "hunt" drives at the plankton in "target" (or the nearest plankton you can sense, else waypoint), aiming where it will be in lead_ticks; "escort" drives to "partner", stopping 0.80 m short unless you sense plankton within 1.50 m of that partner, in which case you go to the plankton so two skimmers arrive together; "sweep" drives to "waypoint" and holds there; "hold" brakes to a stop to wait on a partner; "avoid" runs away from the nearest sensed poison (or to the tank centre if none).
+- target / partner / waypoint: "target" is a sensed plankton id ("F1".."F5") or "none"; "partner" is another skimmer ("SKIM-1".."SKIM-4") or "none"; "waypoint" is [x,y] in metres, clamped into the tank.
+- lead_ticks: aim where the target will be this many ticks ahead (24 ticks = 1s).
+- standoff_m: how wide the autopilot swings around poison (0.0 = ignore it, 2.5 = paranoid).
+- throttle: fraction of full speed requested (0.0..1.0).
+- say: spectators only (<=48 chars; no skimmer ever sees it).
 """
 
 proc systemPrompt*(selection: PromptSelection, captureTarget: int): string =
