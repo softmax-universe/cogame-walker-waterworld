@@ -88,6 +88,8 @@ block noCredentialsFallsBackInstantly:
     check("every seat still has an intent", engine.haveIntent[seat])
     check("the fallback intent is marked as a fallback",
       engine.intents[seat].source == isFallback)
+    check("the fallback intent is neutral hold with zero throttle, not scripted shoal",
+      engine.intents[seat].mode == mHold and engine.intents[seat].throttle255 == 0)
 
 block scriptedSeatsGetNoFallbackRecord:
   var sim = seatedSim()
@@ -347,12 +349,14 @@ block fakeProviderDrivesTheEngine:
     check("two unusable batches are two batches and no more",
       fakeSeen.load(moSequentiallyConsistent) == 2 * SkimmerCount, $fakeSeen.load(moSequentiallyConsistent))
     for seat in 0 ..< SkimmerCount:
-      check("the seat lands on the shoal intent",
-        engine.intents[seat].source == isFallback)
+      check("the seat lands on neutral hold fallback",
+        engine.intents[seat].source == isFallback and
+          engine.intents[seat].mode == mHold and
+          engine.intents[seat].throttle255 == 0)
     var terminal = 0
     for record in records:
       let node = parseJson(record)
-      if node{"detail"}.getStr() == "seat fell back to the shoal intent":
+      if node{"detail"}.getStr() == "seat fell back to neutral hold":
         check("the terminal record says both attempts were spent",
           node{"attempt"}.getInt() == 2, record)
         inc terminal
