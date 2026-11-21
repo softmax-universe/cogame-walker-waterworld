@@ -247,6 +247,21 @@ proc scriptedFor*(
 ): SkimmerIntent =
   scriptedIntent(sim, kind, sim.skimmerForSeat(seat), frame, turnIndex)
 
+proc holdFallbackIntent*(): SkimmerIntent =
+  ## Explicit neutral hold (`mHold`, zero throttle) for an LLM seat whose model
+  ## output is invalid or unavailable. Never substitutes a scripted baseline.
+  SkimmerIntent(
+    mode: mHold,
+    target: -1'i32,
+    partner: -1'i32,
+    waypointXUm: ArenaW div 2,
+    waypointYUm: ArenaH div 2,
+    leadTicks: 0'i32,
+    standoffMm: 0'i32,
+    throttle255: 0'i32,
+    source: isFallback
+  )
+
 proc shoalFor*(
   engine: DecisionEngine, sim: SimServer, seat: int, frame: SensorFrame,
   turnIndex: int
@@ -359,17 +374,14 @@ proc turn*(
         not engine.client.disabled:
       open.add(seat)
     elif engine.seats[seat].isLlm:
-      # An LLM seat that CANNOT call the LLM this turn is a FALLBACK, not a
-      # scripted policy, and the design's `fallback.cause` enum names both
-      # reasons it happens. Recording it is what makes the two countable.
-      var intent = engine.shoalFor(sim, seat, frames[seat], turnIndex)
-      intent.source = isFallback
-      engine.intents[seat] = intent
+      # An LLM seat that CANNOT call the LLM this turn executes a neutral hold
+      # (`mHold`, zero throttle) rather than a scripted baseline policy.
+      engine.intents[seat] = holdFallbackIntent()
       engine.haveIntent[seat] = true
       let cause = if engine.llmOff: "budget_guard" else: "no_credentials"
       result.add(fallbackRecord(turnIndex, seat, 1, cause,
-        "the LLM is unavailable for this turn; playing shoal"))
-      echo "waterworld llm: seat ", seat, " falling back to shoal (", cause,
+        "the LLM is unavailable for this turn; holding position"))
+      echo "waterworld llm: seat ", seat, " falling back to neutral hold (", cause,
         ") on turn ", turnIndex
     else:
       var intent = engine.scriptedFor(
@@ -468,11 +480,9 @@ proc turn*(
         open.len, " seat(s) fall back for turn ", turnIndex
       break
 
-  # --- anything still open plays shoal for this turn -----------------------
+  # --- anything still open holds position (never plays scripted shoal) -----
   for seat in open:
-    var intent = engine.shoalFor(sim, seat, frames[seat], turnIndex)
-    intent.source = isFallback
-    engine.intents[seat] = intent
+    engine.intents[seat] = holdFallbackIntent()
     engine.haveIntent[seat] = true
     let cause =
       if engine.client.disabled or engine.client.transport == ltNone:
@@ -484,9 +494,9 @@ proc turn*(
     ## throttled turn breaks after attempt 1, and a phase-60 count of "seats
     ## that used their retry" reads this field.
     result.add(fallbackRecord(turnIndex, seat, clamp(attempt, 1, 2), cause,
-      "seat fell back to the shoal intent"))
+      "seat fell back to neutral hold"))
     ## "falling back" is the phrase phase 60 greps the GAME log for.
-    echo "waterworld llm: seat ", seat, " falling back to shoal (", cause,
+    echo "waterworld llm: seat ", seat, " falling back to neutral hold (", cause,
       ") on turn ", turnIndex
 
   if not engine.trajectory.isNil:
@@ -512,14 +522,16 @@ proc turn*(
       engine.trajectory.recordDecision($turnIndex & "-" & $seat, $seat,
         observations[seat],
         attempts[seat], selected, action, status,
-        fallbackOrigin = (if status == asFallback: some("engine_scripted") else: none(string)))
+        fallbackOrigin = (if status == asFallback: some("engine_hold") else: none(string)))
 
 proc intentFor*(
   engine: var DecisionEngine, sim: SimServer, seat: int,
   frame: SensorFrame, turnIndex: int
 ): SkimmerIntent =
-  ## The intent the controller compiles this tick: this turn's, else last
-  ## turn's, else `shoal`'s. No failure mode leaves a skimmer uncommanded.
+  ## The intent the controller compiles this tick: this turn's, else neutral
+  ## hold for LLM seats or `shoal` for unregistered scripted seats.
   if seat >= 0 and seat < engine.haveIntent.len and engine.haveIntent[seat]:
     return engine.intents[seat]
+  if seat >= 0 and seat < engine.seats.len and engine.seats[seat].isLlm:
+    return holdFallbackIntent()
   engine.shoalFor(sim, max(0, seat), frame, turnIndex)
