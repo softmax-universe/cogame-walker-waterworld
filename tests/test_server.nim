@@ -170,6 +170,8 @@ block clientRoutesServeRealPages:
       server.find("walker-waterworld server"))
   check("the shutdown grace is bounded",
     "ShutdownGraceSeconds = 20" in server)
+  check("fastMode is disabled during Lobby so early joiners cannot burn the join timeout",
+    "config.fastMode and sim.phase != Lobby" in server)
   check("/healthz keeps answering through the grace",
     "HealthPath" in server)
 
