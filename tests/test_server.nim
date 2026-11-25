@@ -21,11 +21,18 @@ block registrationParsing:
   ## Anything that is not the register object is not a registration, and a
   ## seat's chat is never written to the replay chat stream.
   let llmSeat = parseRegistration(
-    """{"type":"register","prompt":"hunt in pairs","scripted":null,"policy":"tandemhunt"}""")
+    """{"type":"register","prompt":"hunt in pairs","scripted":null,"policy":"tandemhunt","model":"anthropic/claude-haiku-4.5","llm_enabled":true}""")
   check("an LLM registration parses", llmSeat.ok)
   check("its prompt is read", llmSeat.prompt == "hunt in pairs")
   check("its baseline is empty", llmSeat.scripted.len == 0)
   check("its label is read", llmSeat.policy == "tandemhunt")
+  check("its model is read", llmSeat.model == "anthropic/claude-haiku-4.5")
+  check("its llm_enabled flag is read", llmSeat.llmEnabled)
+  let failureJson = parseJson(playerFailurePayload(2, "transport timeout", "episode_inconclusive"))
+  check("playerFailurePayload has exactly 3 keys", failureJson.len == 3, $failureJson.len)
+  check("playerFailurePayload carries failed_policy_index", failureJson["failed_policy_index"].getInt() == 2)
+  check("playerFailurePayload carries kind", failureJson["kind"].getStr() == "episode_inconclusive")
+  check("playerFailurePayload carries message", failureJson["message"].getStr() == "transport timeout")
   let scriptedSeat = parseRegistration(
     """{"type":"register","prompt":"","scripted":"drifter","policy":"drifter"}""")
   check("a scripted registration parses", scriptedSeat.ok)

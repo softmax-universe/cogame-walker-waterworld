@@ -192,13 +192,13 @@ proc playerIdentity(request: Request, slot: int, token: string): string =
 
 proc parseRegistration*(
   text: string
-): tuple[ok: bool, prompt, scripted, policy: string] =
+): tuple[ok: bool, prompt, scripted, policy, model: string, llmEnabled: bool] =
   ## A seat's ONE Sprite v1 chat message, read as its registration:
-  ##   {"type":"register","prompt":"…","scripted":"shoal"|null,"policy":"…"}
+  ##   {"type":"register","prompt":"…","scripted":"shoal"|null,"policy":"…","model":"…","llm_enabled":true}
   ## Anything that is not that object is not a registration, and a seat's chat
   ## is NEVER written to the replay chat stream: the prompt is a secret. What
   ## the replay gets is a redacted `register` record.
-  result = (false, "", "", "")
+  result = (false, "", "", "", "", false)
   if text.len == 0 or text[0] != '{':
     return
   var node: JsonNode
@@ -213,6 +213,10 @@ proc parseRegistration*(
   if not node{"scripted"}.isNil and node{"scripted"}.kind == JString:
     result.scripted = node{"scripted"}.getStr()
   result.policy = node{"policy"}.getStr()
+  if not node{"model"}.isNil and node{"model"}.kind == JString:
+    result.model = node{"model"}.getStr().strip()
+  if not node{"llm_enabled"}.isNil and node{"llm_enabled"}.kind == JBool:
+    result.llmEnabled = node{"llm_enabled"}.getBool()
 
 proc isPlayerReadyPacket(message: string): bool =
   message.len == 1 and message[0].uint8 == SpriteClientReady
@@ -383,15 +387,38 @@ proc runFrameLimiter(
     sleep(max(1, min(2, int(remaining.inMilliseconds))))
   previousTick = getMonoTime()
 
-proc declarePlayerFailure(slot: int, message: string) =
-  ## Publishes the game-declared terminal player failure the platform runner
-  ## polls for, so a lobby no-show is charged to the seat that caused it instead
-  ## of poisoning the whole episode unattributed. Best effort: outside the
-  ## platform (env unset) this is a no-op.
+proc playerFailurePayload*(slot: int, message: string, kind = "player_error"): string =
+  ## Strict `GamePlayerFailure` JSON compatible with the platform runner
+  ## (`extra="forbid"`): only `failed_policy_index`, `message` (1..2000 chars),
+  ## and `kind` ("player_error" or "episode_inconclusive").
+  let boundedMsg =
+    if message.strip().len > 0: message.strip().truncateRunes(1950)
+    else: "player slot " & $max(0, slot) & " failed"
+  let safeKind =
+    if kind == "episode_inconclusive": "episode_inconclusive"
+    else: "player_error"
+  $(%*{
+    "failed_policy_index": max(0, slot),
+    "message": boundedMsg,
+    "kind": safeKind
+  })
+
+proc declarePlayerFailure(slot: int, message: string, kind = "player_error") =
+  ## Publishes the game-declared terminal failure atomically for file:// URIs
+  ## (temp file + rename), or via writeCogameEnv for HTTP URIs. Best effort:
+  ## outside the platform (env unset) this is a no-op.
+  let uri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  if uri.len == 0:
+    return
+  let payload = playerFailurePayload(slot, message, kind)
   try:
-    writeCogameEnv("COGAME_PLAYER_FAILURE_URI",
-      $(%*{"failed_policy_index": slot, "message": message}),
-      "application/json")
+    if uri.startsWith("file://"):
+      let dest = uri[7 .. ^1]
+      let tmpPath = dest & ".tmp." & $getCurrentProcessId()
+      writeFile(tmpPath, payload)
+      moveFile(tmpPath, dest)
+    else:
+      writeCogameEnv("COGAME_PLAYER_FAILURE_URI", payload, "application/json")
   except CatchableError as e:
     echo "player-failure declaration failed: ", e.msg
 
@@ -479,6 +506,7 @@ proc runServerLoop*(
     lastTurnIndex = -1
     quitAfterFrame = false
     noShowReported = false
+    terminalFailure = TurnFailure()
     lastCmds = newSeq[uint8](SkimmerCount)
 
   while true:
@@ -497,10 +525,28 @@ proc runServerLoop*(
         (getMonoTime() - episodeStart).inSeconds.int >=
           config.wallClockBudgetSeconds:
       deadlineHit = true
-      echo "wall-clock budget of ", config.wallClockBudgetSeconds,
-        "s reached; settling the episode from the state at this tick"
-      sim.endEpisode(ReasonDeadline, EndRuleWallClock)
-      quitAfterFrame = true
+      var llmSeat = -1
+      for seat in 0 ..< engine.seats.len:
+        if engine.seats[seat].isLlm:
+          llmSeat = seat
+          break
+      if llmSeat >= 0:
+        echo "wall-clock budget of ", config.wallClockBudgetSeconds,
+          "s reached during LLM episode; ending inconclusive"
+        terminalFailure = TurnFailure(
+          failed: true,
+          seat: llmSeat,
+          kind: "episode_inconclusive",
+          cause: "wall_clock",
+          message: "wall-clock budget of " & $config.wallClockBudgetSeconds &
+            "s reached before episode completed"
+        )
+        quitAfterFrame = true
+      else:
+        echo "wall-clock budget of ", config.wallClockBudgetSeconds,
+          "s reached; settling the episode from the state at this tick"
+        sim.endEpisode(ReasonDeadline, EndRuleWallClock)
+        quitAfterFrame = true
 
     {.gcsafe.}:
       withLock appState.lock:
@@ -548,20 +594,22 @@ proc runServerLoop*(
               break
 
           if sim.lobbyJoinTimedOut() and not noShowReported:
-            ## A seat that never connects does NOT end the episode: report the
-            ## no-show (lowest missing slot only), then start anyway. Its
-            ## skimmer is driven by the `shoal` baseline for the whole run and
-            ## three skimmers can still capture, so the episode stays
-            ## meaningful.
+            ## A seat that never connects ends the episode with a typed player
+            ## failure rather than substituting a scripted baseline and emitting
+            ## default gameplay scores.
             noShowReported = true
             let stuckSlot = sim.nextPlayerSlot()
-            declarePlayerFailure(stuckSlot,
-              "player slot " & $stuckSlot & " never joined the lobby within " &
+            terminalFailure = TurnFailure(
+              failed: true,
+              seat: stuckSlot,
+              kind: "player_error",
+              cause: "lobby_timeout",
+              message: "player slot " & $stuckSlot &
+                " never joined the lobby within " &
                 $config.lobbyJoinTimeoutTicks & " lobby ticks (~" &
-                $(config.lobbyJoinTimeoutTicks div TargetFps) &
-                "s); its skimmer plays the shoal baseline")
-            sim.config.minPlayers = max(1, sim.players.len)
-            config.minPlayers = sim.config.minPlayers
+                $(config.lobbyJoinTimeoutTicks div TargetFps) & "s)"
+            )
+            quitAfterFrame = true
 
           # Registrations. A seat's chat is its REGISTRATION, consumed here and
           # never written to the replay chat stream. Held (not dropped) while
@@ -581,7 +629,9 @@ proc runServerLoop*(
             let first = not policy.registered
             policy.registered = true
             policy.prompt = registration.prompt.truncateRunes(MaxPromptRunes)
-            policy.isLlm = policy.prompt.len > 0
+            policy.model = registration.model
+            policy.isLlm = (registration.scripted.len == 0) and
+              (policy.prompt.len > 0 or registration.llmEnabled or policy.model.len > 0)
             policy.baseline = parseBaseline(registration.scripted)
             policy.label =
               if registration.policy.len > 0: registration.policy
@@ -595,7 +645,9 @@ proc runServerLoop*(
                 registerRecord(seat, sim.skimmerForSeat(seat), policy.label,
                   engine.policyKind(seat), $policy.baseline))
               echo "seat ", seat, " registered: kind=",
-                engine.policyKind(seat), " baseline=", $policy.baseline
+                engine.policyKind(seat),
+                " model=", (if policy.model.len > 0: policy.model else: "(default)"),
+                " baseline=", $policy.baseline
           appState.chatMessages.clear()
           for (websocket, chatText) in held:
             appState.chatMessages[websocket] = chatText
@@ -640,57 +692,63 @@ proc runServerLoop*(
           let records = engine.turn(sim, frames, turnIndex, elapsedSeconds)
           for record in records:
             replayWriter.writeChat(tickTime(sim.tickCount), 0, record)
-          for seat in 0 ..< sim.seatCount():
-            if not engine.haveIntent[seat]:
-              continue
-            let record = engine.intents[seat].boundedIntentRecord(
-              turnIndex, seat, sim.skimmerForSeat(seat))
-            replayWriter.writeChat(tickTime(sim.tickCount), seat, record)
-            sim.pushFeedIntent(record)
-            sim.emitEvent(Intent, source = seat,
-              amount = turnIndex, content = engine.intents[seat].note)
-        # One command byte per SKIMMER, in index order, every tick.
-        var cmds = newSeq[uint8](SkimmerCount)
-        for i in 0 ..< SkimmerCount:
-          let seat = sim.seatForSkimmer(i)
-          let frame = if seat >= 0 and seat < frames.len: frames[seat]
-                      else: sim.frameFor(i)
-          let intent = engine.intentFor(sim, seat, frame, turnIndex)
-          cmds[i] = engine.ctl.thrustCommand(sim, i, frame, intent)
-        # The byte is recorded BY SKIMMER INDEX, not by seat: that is the index
-        # `sim.step` consumes, so playback needs no translation and cannot get
-        # the mapping backwards. (The join stream is by SEAT; the two index
-        # spaces coincide in size and `perm` is in the config JSON.)
-        for i in 0 ..< SkimmerCount:
-          replayWriter.writeInputMaskChange(
-            tickTime(sim.tickCount), i, cmds[i])
-        lastCmds = cmds
+          if engine.lastFailure.failed:
+            terminalFailure = engine.lastFailure
+            quitAfterFrame = true
+          else:
+            for seat in 0 ..< sim.seatCount():
+              if not engine.haveIntent[seat]:
+                continue
+              let record = engine.intents[seat].boundedIntentRecord(
+                turnIndex, seat, sim.skimmerForSeat(seat))
+              replayWriter.writeChat(tickTime(sim.tickCount), seat, record)
+              sim.pushFeedIntent(record)
+              sim.emitEvent(Intent, source = seat,
+                amount = turnIndex, content = engine.intents[seat].note)
+        if not quitAfterFrame:
+          # One command byte per SKIMMER, in index order, every tick.
+          var cmds = newSeq[uint8](SkimmerCount)
+          for i in 0 ..< SkimmerCount:
+            let seat = sim.seatForSkimmer(i)
+            let frame = if seat >= 0 and seat < frames.len: frames[seat]
+                        else: sim.frameFor(i)
+            let intent = engine.intentFor(sim, seat, frame, turnIndex)
+            cmds[i] = engine.ctl.thrustCommand(sim, i, frame, intent)
+          # The byte is recorded BY SKIMMER INDEX, not by seat: that is the index
+          # `sim.step` consumes, so playback needs no translation and cannot get
+          # the mapping backwards. (The join stream is by SEAT; the two index
+          # spaces coincide in size and `perm` is in the config JSON.)
+          for i in 0 ..< SkimmerCount:
+            replayWriter.writeInputMaskChange(
+              tickTime(sim.tickCount), i, cmds[i])
+          lastCmds = cmds
       else:
         for seat in 0 ..< SkimmerCount:
           replayWriter.writeInputMaskChange(tickTime(sim.tickCount), seat, 0'u8)
         lastCmds = newSeq[uint8](SkimmerCount)
 
-      var faultRule = ""
-      try:
-        sim.step(lastCmds)
-      except SimGuardError as guard:
-        echo "waterworld: SIM GUARD tripped at tick ", sim.tickCount, ": ",
-          guard.msg
-        faultRule = EndRuleSimFault
-      except CatchableError as error:
-        echo "waterworld: HOST ERROR at tick ", sim.tickCount, ": ", error.msg
-        faultRule = EndRuleHostError
-      if faultRule.len > 0:
-        sim.endEpisode(ReasonFault, faultRule)
-        quitAfterFrame = true
-      replayWriter.writeHash(uint32(sim.tickCount), sim.gameHash())
-      if sim.collectEvents:
-        for event in sim.events:
-          collectedEvents.add(event)
-        sim.events.setLen(0)
-      sim.stepEvents(broadcastTracker, frameEvents)
-      if sim.phase == GameOver and sim.gameOverTimer <= 0:
-        quitAfterFrame = true
+      if not quitAfterFrame:
+        var faultRule = ""
+        try:
+          sim.step(lastCmds)
+        except SimGuardError as guard:
+          echo "waterworld: SIM GUARD tripped at tick ", sim.tickCount, ": ",
+            guard.msg
+          faultRule = EndRuleSimFault
+        except CatchableError as error:
+          echo "waterworld: HOST ERROR at tick ", sim.tickCount, ": ", error.msg
+          faultRule = EndRuleHostError
+        if faultRule.len > 0:
+          sim.endEpisode(ReasonFault, faultRule)
+          quitAfterFrame = true
+        replayWriter.writeHash(uint32(sim.tickCount), sim.gameHash())
+        if sim.collectEvents:
+          for event in sim.events:
+            collectedEvents.add(event)
+          sim.events.setLen(0)
+        sim.stepEvents(broadcastTracker, frameEvents)
+        if sim.phase == GameOver and sim.gameOverTimer <= 0:
+          quitAfterFrame = true
 
     # --- publish the frame -------------------------------------------------
     for i in 0 ..< sockets.len:
@@ -760,6 +818,37 @@ proc runServerLoop*(
             discard markSocketClosed(globalViewers[i])
 
     if quitAfterFrame:
+      if terminalFailure.failed:
+        ## Preserve partial replay and trajectory, declare typed failure
+        ## atomically, and NEVER write default gameplay scores to results.json.
+        replayWriter.closeReplayWriter()
+        if saveReplayPath.len > 0 and fileExists(saveReplayPath):
+          echo "Partial replay written: ", saveReplayPath, " (",
+            getFileSize(saveReplayPath), " bytes)"
+          runtimeConfig.writeReplay(readFile(saveReplayPath))
+        if eventsPath.len > 0:
+          writeFile(eventsPath, collectedEvents.eventsJsonl(sim.tickCount))
+          echo "Events written: ", eventsPath, " (", collectedEvents.len,
+            " events)"
+        engine.trajectory.finishCapture(%*{
+          "reason": "fault",
+          "endRule": terminalFailure.cause,
+          "kind": terminalFailure.kind,
+          "failed_policy_index": terminalFailure.seat,
+          "message": terminalFailure.message,
+          "scores": newJArray()
+        })
+        declarePlayerFailure(
+          terminalFailure.seat,
+          terminalFailure.message,
+          terminalFailure.kind
+        )
+        echo "terminal failure declared (", terminalFailure.kind, ", seat ",
+          terminalFailure.seat, "): ", terminalFailure.message
+        sleep(2000)
+        httpServer.close()
+        joinThread(serverThread)
+        break
       ## The `result` control record: the whole results document, written once
       ## into the replay chat stream at episode end, so the replay is
       ## SELF-SUFFICIENT — the outcome would otherwise live only at

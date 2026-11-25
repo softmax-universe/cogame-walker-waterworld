@@ -35,9 +35,20 @@ type
     ## or never registers at all — is `shoal`.
     isLlm*: bool
     prompt*: string
+    model*: string
     baseline*: Baseline
     label*: string
     registered*: bool
+
+  TurnFailure* = object
+    ## Typed terminal failure for an LLM seat when inference or action parsing
+    ## fails. Never substituted with a fallback action or default score.
+    failed*: bool
+    seat*: int
+    kind*: string          ## "player_error" or "episode_inconclusive"
+    cause*: string
+    message*: string
+    rawOutput*: string
 
   DecisionEngine* = object
     trajectory*: DecisionTrajectory
@@ -49,7 +60,8 @@ type
     haveIntent*: seq[bool]
     lastBatchStart*: MonoTime
     batchStarted*: bool
-    llmOff*: bool            ## the budget guard fired; scripted from here on
+    llmOff*: bool            ## the budget guard fired
+    lastFailure*: TurnFailure
     records*: seq[string]    ## chat records queued for the replay writer
 
 proc initDecisionEngine*(sim: SimServer, selection: PromptSelection): DecisionEngine =
@@ -247,27 +259,11 @@ proc scriptedFor*(
 ): SkimmerIntent =
   scriptedIntent(sim, kind, sim.skimmerForSeat(seat), frame, turnIndex)
 
-proc holdFallbackIntent*(): SkimmerIntent =
-  ## Explicit neutral hold (`mHold`, zero throttle) for an LLM seat whose model
-  ## output is invalid or unavailable. Never substitutes a scripted baseline.
-  SkimmerIntent(
-    mode: mHold,
-    target: -1'i32,
-    partner: -1'i32,
-    waypointXUm: ArenaW div 2,
-    waypointYUm: ArenaH div 2,
-    leadTicks: 0'i32,
-    standoffMm: 0'i32,
-    throttle255: 0'i32,
-    source: isFallback
-  )
-
 proc shoalFor*(
   engine: DecisionEngine, sim: SimServer, seat: int, frame: SensorFrame,
   turnIndex: int
 ): SkimmerIntent =
-  ## The published `shoal` intent — the per-turn fallback and the driver of any
-  ## skimmer whose seat never connected.
+  ## The published `shoal` intent for explicit scripted seats.
   var intent = shoalIntent(sim, sim.skimmerForSeat(seat), frame, turnIndex)
   intent.source = isScripted
   intent
@@ -336,27 +332,16 @@ proc turn*(
   elapsedSeconds: int
 ): seq[string] =
   ## Runs ONE decision turn and installs each seat's intent. Returns the replay
-  ## chat records this turn produced. NEVER raises: every failure path ends in a
-  ## legal intent.
+  ## chat records this turn produced. On any LLM backend, invalid-model, or
+  ## action-parsing failure, records the failure in `engine.lastFailure` WITHOUT
+  ## substituting a fallback action or continuing with default gameplay scores.
+  engine.lastFailure = TurnFailure()
   var observations: seq[JsonNode]
   for seat in 0 ..< sim.seatCount():
     observations.add(parseJson(engine.seatViewJson(sim, seat, turnIndex, frames[seat])))
-  let budget = initDuration(milliseconds = max(1, sim.config.turnBudgetMs))
-  ## The per-turn budget covers the ATTEMPTS, not the inter-batch floor: the
-  ## floor is measured start-to-start and is already accounted for separately in
-  ## the episode arithmetic, so a long floor must not eat the retry. Re-taken
-  ## after the floor sleep below.
-  var turnStart = getMonoTime()
-  ## Throttle state is PER TURN: a daily-token 429 on turn k says nothing about
-  ## turn k+1 (the sidecar's window may have rolled), so the flag is cleared
-  ## here and only suppresses this turn's retry.
   engine.client.throttled = false
 
-  # --- budget guard: settle EARLY rather than overrun ----------------------
-  # If two more full turns (batch spacing INCLUDED) would not fit inside the
-  # engine's own wall-clock stop, switch the LLM off for the rest of the episode
-  # and finish on the scripted layer (microseconds per turn), so the episode
-  # ends complete/* rather than deadline.
+  # --- budget guard: stop cleanly as inconclusive rather than substituting ---
   if not engine.llmOff:
     let turnSeconds =
       (sim.config.turnBudgetMs + sim.config.turnSpacingMs + 999) div 1000
@@ -364,8 +349,7 @@ proc turn*(
       engine.llmOff = true
       result.add(budgetGuardRecord(
         turnIndex, max(0, sim.config.wallClockBudgetSeconds - elapsedSeconds)))
-      echo "waterworld: budget guard fired at turn ", turnIndex,
-        "; remaining turns play scripted"
+      echo "waterworld: budget guard fired at turn ", turnIndex
 
   # --- which seats need a call? -------------------------------------------
   var open: seq[int]
@@ -374,15 +358,24 @@ proc turn*(
         not engine.client.disabled:
       open.add(seat)
     elif engine.seats[seat].isLlm:
-      # An LLM seat that CANNOT call the LLM this turn executes a neutral hold
-      # (`mHold`, zero throttle) rather than a scripted baseline policy.
-      engine.intents[seat] = holdFallbackIntent()
-      engine.haveIntent[seat] = true
       let cause = if engine.llmOff: "budget_guard" else: "no_credentials"
-      result.add(fallbackRecord(turnIndex, seat, 1, cause,
-        "the LLM is unavailable for this turn; holding position"))
-      echo "waterworld llm: seat ", seat, " falling back to neutral hold (", cause,
-        ") on turn ", turnIndex
+      let msg =
+        if engine.llmOff:
+          "seat " & $seat & " turn " & $turnIndex &
+            ": wall-clock budget guard fired before LLM turn"
+        else:
+          "seat " & $seat & " turn " & $turnIndex &
+            ": LLM provider is unavailable (no endpoint or credentials)"
+      result.add(fallbackRecord(turnIndex, seat, 1, cause, msg))
+      echo "waterworld llm: ", msg
+      if not engine.lastFailure.failed:
+        engine.lastFailure = TurnFailure(
+          failed: true,
+          seat: seat,
+          kind: "episode_inconclusive",
+          cause: cause,
+          message: msg
+        )
     else:
       var intent = engine.scriptedFor(
         sim, seat, engine.seats[seat].baseline, frames[seat], turnIndex)
@@ -390,64 +383,53 @@ proc turn*(
       engine.intents[seat] = intent
       engine.haveIntent[seat] = true
 
+  if engine.lastFailure.failed:
+    if not engine.trajectory.isNil:
+      for seat in 0 ..< sim.seatCount():
+        if engine.seats[seat].isLlm:
+          engine.trajectory.recordDecision($turnIndex & "-" & $seat, $seat,
+            observations[seat], @[], none(string), newJNull(), asFallback,
+            fallbackOrigin = none(string))
+    return result
+
   # --- the rate floor -----------------------------------------------------
   if open.len > 0:
     discard engine.waitOutInterBatchFloor(sim, turnIndex, elapsedSeconds)
   if open.len > 0:
     engine.lastBatchStart = getMonoTime()
     engine.batchStarted = true
-  # The attempts get the WHOLE per-turn budget: `attempt1Ms + retryMs` is sized
-  # to fit inside it (asserted by test_engine's deadlineArithmetic), and a turn
-  # that had just slept out a full spacing would otherwise skip its own retry.
-  turnStart = getMonoTime()
 
   var attempts = newSeq[seq[DecisionAttempt]](SkimmerCount)
-  # --- up to two PARALLEL batches -----------------------------------------
-  var attempt = 0
-  while open.len > 0 and attempt < 2:
-    if engine.client.disabled:
-      break
-    if getMonoTime() - turnStart >= budget:
-      for seat in open:
-        result.add(fallbackRecord(turnIndex, seat, attempt + 1, "timeout",
-          "per-turn budget exhausted before attempt " & $(attempt + 1)))
-      break
-    let deadlineMs =
-      if attempt == 0: sim.config.attempt1Ms else: sim.config.retryMs
+  # --- ONE parallel batch per turn (no retries) ---------------------------
+  if open.len > 0:
+    let deadlineMs = sim.config.attempt1Ms
     var batch: RequestBatch
     var evidence: seq[DecisionAttempt]
     for position, seat in open:
-      var user = engine.seatViewJson(sim, seat, turnIndex, frames[seat])
-      if attempt > 0:
-        user.add("\n\nYour previous reply was not usable. Reply with ONLY " &
-          "the JSON object described above, starting with '{'.")
+      let user = engine.seatViewJson(sim, seat, turnIndex, frames[seat])
+      let sys = systemPrompt(engine.selection, sim.config.captureTarget)
+      let fullUser = userMessage(engine.seats[seat].prompt, user)
       let request = engine.client.requestFor(
-        systemPrompt(engine.selection, sim.config.captureTarget), userMessage(engine.seats[seat].prompt, user), seat)
-      evidence.add(requestEvidence($turnIndex & "-" & $seat & "-" & $attempt,
-        engine.seats[seat].label, systemPrompt(engine.selection, sim.config.captureTarget),
-        userMessage(engine.seats[seat].prompt, user), request.body))
+        sys, fullUser, seat, engine.seats[seat].model)
+      evidence.add(requestEvidence($turnIndex & "-" & $seat & "-0",
+        engine.seats[seat].label, sys, fullUser, request.body))
       batch.post(request.url, request.headers, request.body, $seat)
     let started = getMonoTime()
-    # curly hands the deadline to CURLOPT_TIMEOUT, whose granularity is WHOLE
-    # SECONDS, so this conversion FLOORS — which is why sim_config refuses a
-    # sub-second value and why every pinned deadline is a whole number of
-    # seconds: 9000 -> 9 s, 5000 -> 5 s, worst case 14 s inside the 16 s cap.
     let responses = engine.client.curl.makeRequests(
       batch, max(1, deadlineMs div 1000))
     let latency = (getMonoTime() - started).inMilliseconds.int
-    var stillOpen: seq[int]
     for position, seat in open:
-      var cause = "parse_error"
       var receipt = evidence[position]
       receipt.latencyMs = some(float(latency))
       receipt.receivedEvidence(responses[position].response)
+      var rawText = ""
       try:
-        let text = engine.client.textOf(
+        rawText = engine.client.textOf(
           responses[position].response, responses[position].error,
           batch[position].url)
-        receipt.response = %text
+        receipt.response = %rawText
         var intent = parseIntent(
-          extractJsonObject(text),
+          extractJsonObject(rawText),
           engine.intents[seat],
           engine.haveIntent[seat],
           sim.skimmerForSeat(seat))
@@ -456,51 +438,53 @@ proc turn*(
         engine.intents[seat] = intent
         engine.haveIntent[seat] = true
         receipt.accepted = true
+      except LlmError as error:
+        receipt.rejectionReason = some(error.msg)
+        let kind = if error.kind.len > 0: error.kind else: "episode_inconclusive"
+        let cause = if error.cause.len > 0: error.cause else: "transport_error"
+        let msg = ("seat " & $seat & " turn " & $turnIndex & " (" & cause &
+          "): " & error.msg).truncateRunes(1800)
+        result.add(fallbackRecord(turnIndex, seat, 1, cause, error.msg))
+        echo "waterworld llm: ", msg
+        if not engine.lastFailure.failed:
+          engine.lastFailure = TurnFailure(
+            failed: true,
+            seat: seat,
+            kind: kind,
+            cause: cause,
+            message: msg,
+            rawOutput: rawText
+          )
       except CatchableError as error:
         receipt.rejectionReason = some(error.msg)
-        if responses[position].error.len > 0:
-          cause = (if "timeout" in responses[position].error.toLowerAscii():
-                     "timeout" else: "transport_error")
-        elif error.msg.startsWith("llm throttled"):
-          ## Name the throttle for what it is. Reporting a 429 as
-          ## `parse_error` is what made a hosted log unreadable.
-          cause = "throttled"
-        result.add(fallbackRecord(turnIndex, seat, attempt + 1, cause, error.msg))
-        echo "waterworld llm: seat ", seat, " attempt ", attempt + 1,
-          " failed, falling back if it fails again: ", error.msg
-        stillOpen.add(seat)
+        let rawPreview = rawText.replace("\r", " ").replace("\n", " ").truncateRunes(1000)
+        let msg = ("seat " & $seat & " turn " & $turnIndex & " (parse_error): " &
+          error.msg & (if rawPreview.len > 0: " | raw: " & rawPreview else: "")
+          ).truncateRunes(1800)
+        result.add(fallbackRecord(turnIndex, seat, 1, "parse_error",
+          error.msg & (if rawPreview.len > 0: " | raw: " & rawPreview else: "")))
+        echo "waterworld llm: ", msg
+        if not engine.lastFailure.failed:
+          engine.lastFailure = TurnFailure(
+            failed: true,
+            seat: seat,
+            kind: "player_error",
+            cause: "parse_error",
+            message: msg,
+            rawOutput: rawText
+          )
       attempts[seat].add(receipt)
-    open = stillOpen
-    inc attempt
-    if engine.client.throttled and open.len > 0:
-      # FAIL FAST. The only model left answered 429, so the retry batch would be
-      # refused the same way: spend the rest of the turn on the scripted layer
-      # instead of on a call that cannot land.
-      echo "waterworld llm: provider throttled with no other candidate; ",
-        open.len, " seat(s) fall back for turn ", turnIndex
-      break
-
-  # --- anything still open holds position (never plays scripted shoal) -----
-  for seat in open:
-    engine.intents[seat] = holdFallbackIntent()
-    engine.haveIntent[seat] = true
-    let cause =
-      if engine.client.disabled or engine.client.transport == ltNone:
-        "no_credentials"
-      elif engine.llmOff: "budget_guard"
-      elif engine.client.throttled: "throttled"
-      else: "parse_error"
-    ## The attempt count is what the seat ACTUALLY spent, not a constant 2: a
-    ## throttled turn breaks after attempt 1, and a phase-60 count of "seats
-    ## that used their retry" reads this field.
-    result.add(fallbackRecord(turnIndex, seat, clamp(attempt, 1, 2), cause,
-      "seat fell back to neutral hold"))
-    ## "falling back" is the phrase phase 60 greps the GAME log for.
-    echo "waterworld llm: seat ", seat, " falling back to neutral hold (", cause,
-      ") on turn ", turnIndex
 
   if not engine.trajectory.isNil:
     for seat in 0 ..< sim.seatCount():
+      let failedSeat = engine.lastFailure.failed and
+        (not engine.haveIntent[seat] or
+         (attempts[seat].len > 0 and not attempts[seat][^1].accepted))
+      if failedSeat:
+        engine.trajectory.recordDecision($turnIndex & "-" & $seat, $seat,
+          observations[seat], attempts[seat], none(string), newJNull(),
+          asFallback, fallbackOrigin = none(string))
+        continue
       let intent = engine.intents[seat]
       let action = intent.intentRecord(turnIndex, seat, sim.skimmerForSeat(seat))
       var selected = none(string)
@@ -522,16 +506,13 @@ proc turn*(
       engine.trajectory.recordDecision($turnIndex & "-" & $seat, $seat,
         observations[seat],
         attempts[seat], selected, action, status,
-        fallbackOrigin = (if status == asFallback: some("engine_hold") else: none(string)))
+        fallbackOrigin = none(string))
 
 proc intentFor*(
   engine: var DecisionEngine, sim: SimServer, seat: int,
   frame: SensorFrame, turnIndex: int
 ): SkimmerIntent =
-  ## The intent the controller compiles this tick: this turn's, else neutral
-  ## hold for LLM seats or `shoal` for unregistered scripted seats.
+  ## The intent the controller compiles this tick.
   if seat >= 0 and seat < engine.haveIntent.len and engine.haveIntent[seat]:
     return engine.intents[seat]
-  if seat >= 0 and seat < engine.seats.len and engine.seats[seat].isLlm:
-    return holdFallbackIntent()
   engine.shoalFor(sim, max(0, seat), frame, turnIndex)

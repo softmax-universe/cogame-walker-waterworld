@@ -56,6 +56,15 @@ type
       ## refused again.
 
   LlmError* = object of ValueError
+    kind*: string          ## "episode_inconclusive" or "player_error"
+    cause*: string
+    httpStatus*: int
+
+proc newLlmError(msg, kind, cause: string, httpStatus = 0): ref LlmError =
+  result = newException(LlmError, msg)
+  result.kind = kind
+  result.cause = cause
+  result.httpStatus = httpStatus
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -105,9 +114,13 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   )
   let sidecarEndpoint = getEnv("COWORLD_LLM_ENDPOINT").strip()
   if sidecarEndpoint.len > 0:
+    let envModel = getEnv("COWORLD_LLM_MODEL").strip()
     result.transport = ltSidecar
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
-    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
+    result.model =
+      if config.model.len > 0: config.model
+      elif envModel.len > 0: envModel
+      else: "anthropic/claude-haiku-4.5"
     result.curl = newCurly()
     return
   let
@@ -140,9 +153,12 @@ proc newLlmClient*(config: GameConfig): LlmClient =
       "every turn is falling back to the scripted layer"
 
 proc requestFor*(
-  client: LlmClient, system, user: string, slot: int
+  client: LlmClient, system, user: string, slot: int, modelOverride = ""
 ): tuple[url: string, headers: HttpHeaders, body: string] =
   ## One Messages-API request, shaped for whichever transport is live.
+  let chosenModel =
+    if modelOverride.strip().len > 0: modelOverride.strip()
+    else: client.model
   var body = %*{
     "max_tokens": client.maxOutputTokens,
     "system": system,
@@ -156,16 +172,20 @@ proc requestFor*(
     body["anthropic_version"] = %BedrockAnthropicVersion
     if client.bedrockToken.len > 0:
       headers["authorization"] = "Bearer " & client.bedrockToken
-    result.url = client.bedrockUrl()
+    result.url =
+      if modelOverride.strip().len > 0:
+        client.bedrockEndpoint & "/model/" & modelOverride.strip() & "/invoke"
+      else:
+        client.bedrockUrl()
   elif client.transport == ltSidecar:
-    body["model"] = %client.model
+    body["model"] = %chosenModel
     headers["anthropic-version"] = AnthropicVersion
     result.url = client.sidecarEndpoint & "/v1/messages"
   else:
-    body["model"] = %client.model
+    body["model"] = %chosenModel
     ## Only the Claude 5 / Opus tiers accept an effort setting; Haiku 4.5
     ## rejects the whole request with a 400 if it is present.
-    if "haiku" notin client.model and "4-5" notin client.model:
+    if "haiku" notin chosenModel and "4-5" notin chosenModel:
       body["output_config"] = %*{"effort": "low"}
     headers["x-api-key"] = client.apiKey
     headers["anthropic-version"] = AnthropicVersion
@@ -176,41 +196,63 @@ proc requestFor*(
 proc textOf*(
   client: LlmClient, response: Response, error, url: string
 ): string =
-  ## The text of one batched reply, or an LlmError describing why there is none.
-  ## Auth failure disables the client for the rest of the episode;
-  ## model-access denial and throttling rotate the Bedrock model for the next
-  ## batch instead.
+  ## The text of one batched reply, or a typed LlmError distinguishing
+  ## infrastructure/transport inconclusive failures from player-attributed errors.
   if error.len > 0:
-    raise newException(LlmError, "llm transport: " & error)
+    let cause =
+      if "timeout" in error.toLowerAscii(): "timeout"
+      else: "transport_error"
+    raise newLlmError("llm transport: " & error, "episode_inconclusive", cause)
   if response.code == 401 or response.code == 403:
-    ## RUNE-safe: this text becomes `fallback.detail` in the replay, and a
-    ## provider body is arbitrary bytes. A byte slice can cut a codepoint in
-    ## half, and truncateRunes downstream only SHORTENS — it cannot repair a
-    ## broken one.
     let detail = response.body.truncateRunes(MaxFallbackDetailRunes)
     if "Model access is denied" in response.body and
         client.tryNextBedrockModel("no model access"):
-      raise newException(LlmError, "bedrock model access denied: " & detail)
+      raise newLlmError("bedrock model access denied: " & detail,
+        "episode_inconclusive", "auth_error", response.code)
     client.disabled = true
-    raise newException(LlmError,
-      "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
+    raise newLlmError(
+      "llm auth failed (" & $response.code & ") at " & url & ": " & detail,
+      "episode_inconclusive", "auth_error", response.code)
   if response.code == 429:
     let detail = response.body.truncateRunes(MaxFallbackDetailRunes)
     if not client.tryNextBedrockModel("throttled"):
       client.throttled = true
-    raise newException(LlmError, "llm throttled (429): " & detail)
+    raise newLlmError("llm throttled (429): " & detail,
+      "episode_inconclusive", "throttled", response.code)
+  if response.code == 400 or response.code == 404:
+    let detail = response.body.truncateRunes(MaxFallbackDetailRunes)
+    raise newLlmError("invalid model or request (" & $response.code & "): " & detail,
+      "player_error", "invalid_model", response.code)
+  if response.code >= 500:
+    raise newLlmError("llm provider error " & $response.code & ": " &
+      response.body.truncateRunes(MaxFallbackDetailRunes),
+      "episode_inconclusive", "provider_error", response.code)
   if response.code < 200 or response.code >= 300:
-    raise newException(LlmError, "anthropic error " & $response.code & ": " &
-      response.body.truncateRunes(MaxFallbackDetailRunes))
-  let payload = parseJson(response.body)
+    raise newLlmError("llm client error " & $response.code & ": " &
+      response.body.truncateRunes(MaxFallbackDetailRunes),
+      "player_error", "provider_client_error", response.code)
+  var payload: JsonNode
+  try:
+    payload = parseJson(response.body)
+  except CatchableError as err:
+    raise newLlmError("llm provider returned non-JSON body: " & err.msg,
+      "episode_inconclusive", "provider_error", response.code)
+  if payload.kind != JObject:
+    raise newLlmError("llm provider returned non-object JSON body",
+      "episode_inconclusive", "provider_error", response.code)
   if payload{"stop_reason"}.getStr() == "refusal":
-    raise newException(LlmError, "anthropic refusal")
-  for contentBlock in payload["content"]:
-    if contentBlock{"type"}.getStr() == "text":
-      result.add(contentBlock{"text"}.getStr())
+    raise newLlmError("anthropic refusal", "player_error", "refusal", response.code)
+  let content = payload{"content"}
+  if not content.isNil and content.kind == JArray:
+    for contentBlock in content:
+      if contentBlock{"type"}.getStr() == "text":
+        result.add(contentBlock{"text"}.getStr())
   if payload{"stop_reason"}.getStr() == "max_tokens" and '{' notin result:
-    raise newException(LlmError, "reply cut off at max_tokens before any " &
-      "JSON: " & result.truncateRunes(160).replace("\n", " "))
+    raise newLlmError("reply cut off at max_tokens before any JSON: " &
+      result.truncateRunes(160).replace("\n", " "),
+      "player_error", "max_tokens", response.code)
+  if result.strip().len == 0:
+    raise newLlmError("empty model reply", "player_error", "empty_reply", response.code)
 
 const Rules = """
 The tank is 12.00 m wide and 8.00 m tall. Coordinates are metres from
@@ -236,16 +278,14 @@ backs off poison for you. You choose WHAT to go for and HOW hard.
 """
 
 const OutputFormat = """
-Reply with a single JSON object and NOTHING else. Your reply MUST begin with '{'.
-Schema:
-{"note":"<=160 chars","mode":"hunt"|"escort"|"sweep"|"hold"|"avoid","target":"F1".."F5"|"none","partner":"SKIM-1".."SKIM-4"|"none","waypoint":[x,y],"lead_ticks":0..24,"standoff_m":0.0..2.5,"throttle":0.0..1.0,"say":"<=48 chars"}
-- Include ALL 9 keys every turn (set "target":"none" or "partner":"none" when unused; never omit "partner"; use "" for "note" or "say" when empty).
-- mode: "hunt" drives at the plankton in "target" (or the nearest plankton you can sense, else waypoint), aiming where it will be in lead_ticks; "escort" drives to "partner", stopping 0.80 m short unless you sense plankton within 1.50 m of that partner, in which case you go to the plankton so two skimmers arrive together; "sweep" drives to "waypoint" and holds there; "hold" brakes to a stop to wait on a partner; "avoid" runs away from the nearest sensed poison (or to the tank centre if none).
-- target / partner / waypoint: "target" is a sensed plankton id ("F1".."F5") or "none"; "partner" is another skimmer ("SKIM-1".."SKIM-4") or "none"; "waypoint" is [x,y] in metres, clamped into the tank.
-- lead_ticks: aim where the target will be this many ticks ahead (24 ticks = 1s).
-- standoff_m: how wide the autopilot swings around poison (0.0 = ignore it, 2.5 = paranoid).
-- throttle: fraction of full speed requested (0.0..1.0).
-- say: spectators only (<=48 chars; no skimmer ever sees it).
+Reply with a single JSON object (optionally inside one ```json code fence) and nothing else.
+Required key: "mode" ("hunt" | "escort" | "sweep" | "hold" | "avoid").
+Optional keys: "target" ("F1".."F5" | "none"), "partner" ("SKIM-1".."SKIM-4" | "none"), "waypoint" ([x, y] in metres), "lead_ticks" (0..24), "standoff_m" (0.0..2.5), "throttle" (0.0..1.0), "note" (<=160 chars), "say" (<=48 chars).
+- "hunt": steer toward "target" (or nearest sensed plankton, else "waypoint"), leading by "lead_ticks".
+- "escort": move toward "partner", stopping 0.80 m short unless plankton is sensed within 1.50 m of that partner, in which case close on the plankton together.
+- "sweep": move to "waypoint" and hold there.
+- "hold": brake to a stop.
+- "avoid": move away from the nearest sensed poison (or toward tank centre if none).
 """
 
 proc systemPrompt*(selection: PromptSelection, captureTarget: int): string =

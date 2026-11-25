@@ -1,4 +1,5 @@
-## Hosted calls must reach the native sidecar without provider credentials.
+## Hosted calls must reach the native sidecar without provider credentials,
+## and registry models must be selectable via config or per-seat override.
 include "../src/waterworld/llm"
 
 block:
@@ -15,4 +16,15 @@ block:
     doAssert body["model"].getStr() == "anthropic/claude-sonnet-4.6"
     doAssert not body.hasKey("anthropic_version")
     doAssert not body.hasKey("output_config")
-  echo "hosted sidecar routing and seat attribution passed"
+
+  let perSeat = client.requestFor("rules", "private view", 0, "openai/gpt-4.1-mini")
+  doAssert parseJson(perSeat.body)["model"].getStr() == "openai/gpt-4.1-mini"
+
+  var cfg = GameConfig()
+  cfg.model = "google/gemini-2.5-flash"
+  let cfgClient = newLlmClient(cfg)
+  let cfgReq = cfgClient.requestFor("rules", "private view", 0)
+  doAssert parseJson(cfgReq.body)["model"].getStr() == "google/gemini-2.5-flash"
+  let seatWins = cfgClient.requestFor("rules", "private view", 0, "anthropic/claude-haiku-4.5")
+  doAssert parseJson(seatWins.body)["model"].getStr() == "anthropic/claude-haiku-4.5"
+  echo "hosted sidecar routing, seat attribution, and model selection passed"

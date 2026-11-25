@@ -65,8 +65,13 @@ prefix="${slug}-smoke-${run_id}"
 network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
+mock_llm_pid=""
 
 cleanup() {
+  if [ -n "${mock_llm_pid}" ]; then
+    kill "${mock_llm_pid}" >/dev/null 2>&1 || true
+    wait "${mock_llm_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,15 +196,72 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+mock_log="${work_dir}/mock_llm_requests.jsonl"
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  echo "COWORLD_LLM_ENDPOINT present: using caller endpoint"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  mock_port_file="${work_dir}/mock_llm_port"
+  python3 - "${mock_port_file}" "${mock_log}" <<'PY' &
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port_file, log_path = sys.argv[1], sys.argv[2]
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "path": self.path,
+                "slot": self.headers.get("X-Coworld-Player-Slot"),
+                "model": body.get("model"),
+            }) + "\n")
+        reply = {
+            "id": "msg_smoke",
+            "type": "message",
+            "role": "assistant",
+            "model": body.get("model", "anthropic/claude-haiku-4.5"),
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": json.dumps({
+                "mode": "sweep",
+                "waypoint": [6.0, 2.5],
+                "throttle": 0.7
+            })}],
+            "usage": {"input_tokens": 100, "output_tokens": 20},
+        }
+        raw = json.dumps(reply).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+server = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+with open(port_file, "w", encoding="utf-8") as fh:
+    fh.write(str(server.server_address[1]))
+server.serve_forever()
+PY
+  mock_llm_pid="$!"
+  for _ in $(seq 1 50); do
+    if [ -s "${mock_port_file}" ]; then break; fi
+    sleep 0.1
+  done
+  mock_port="$(cat "${mock_port_file}")"
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${mock_port}")
+  echo "started local mock LLM sidecar on port ${mock_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
 docker run -d --name "${prefix}-game" \
+  --add-host=host.docker.internal:host-gateway \
   --network "${network}" --network-alias "${prefix}-game" \
   -e COGAME_HOST=0.0.0.0 \
   -e COGAME_PORT="${port}" \
@@ -323,6 +385,14 @@ print(
     f"smoke OK: seats={seats} results={results_path.stat().st_size}B "
     f"replay={replay_path.stat().st_size}B reason={reason}"
 )
+mock_log = work / "mock_llm_requests.jsonl"
+if mock_log.exists():
+    reqs = [json.loads(line) for line in mock_log.read_text().splitlines() if line.strip()]
+    if not reqs:
+        raise SystemExit("mock LLM sidecar received zero requests")
+    if not any(r.get("slot") == "0" and r.get("model") == "anthropic/claude-haiku-4.5" for r in reqs):
+        raise SystemExit(f"mock LLM sidecar did not see expected slot 0 model request: {reqs[:3]}")
+    print(f"mock LLM sidecar verified: {len(reqs)} HTTP requests (slot 0, model={reqs[0].get('model')})")
 PY
 then
   dump_logs

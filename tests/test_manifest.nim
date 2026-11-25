@@ -185,22 +185,34 @@ block gameDocs:
     $ids)
 
 block bundledPlayers:
-  check("there is exactly one bundled player entry", m{"player"}.len == 1)
-  let entry = m{"player"}[0]
-  check("it has an id", entry{"id"}.getStr() == "baseline")
-  check("it has type player", entry{"type"}.getStr() == "player")
-  check("it has a name", entry{"name"}.getStr().len > 0)
-  check("it has a description", entry{"description"}.getStr().len > 0)
-  check("it runs the one player entrypoint",
-    entry{"run"}[0].getStr() == "/bin/walker-waterworld-player")
-  check("it is the shoal baseline",
-    entry{"env"}{"PLAYER_SCRIPTED"}.getStr() == "shoal")
-  check("its cpu limit is exactly \"1\" (below that is a 400 at upload)",
-    entry{"resources"}{"limits"}{"cpu"}.getStr() == "1",
-    entry{"resources"}{"limits"}{"cpu"}.getStr())
-  check("its requests are the starter's",
-    entry{"resources"}{"requests"}{"cpu"}.getStr() == "100m" and
-      entry{"resources"}{"requests"}{"memory"}.getStr() == "64Mi")
+  check("there are two bundled player entries (model and baseline)",
+    m{"player"}.len == 2, $m{"player"}.len)
+  var byId = initTable[string, JsonNode]()
+  for entry in m{"player"}:
+    let id = entry{"id"}.getStr()
+    byId[id] = entry
+    check("player " & id & " has type player", entry{"type"}.getStr() == "player")
+    check("player " & id & " has a name", entry{"name"}.getStr().len > 0)
+    check("player " & id & " has a description", entry{"description"}.getStr().len > 0)
+    check("player " & id & " runs the one player entrypoint",
+      entry{"run"}[0].getStr() == "/bin/walker-waterworld-player")
+    check("player " & id & " cpu limit is \"1\"",
+      entry{"resources"}{"limits"}{"cpu"}.getStr() == "1",
+      entry{"resources"}{"limits"}{"cpu"}.getStr())
+    check("player " & id & " requests are the starter's",
+      entry{"resources"}{"requests"}{"cpu"}.getStr() == "100m" and
+        entry{"resources"}{"requests"}{"memory"}.getStr() == "64Mi")
+  check("model player is declared", byId.hasKey("model"))
+  if byId.hasKey("model"):
+    let mp = byId["model"]
+    check("model player enables COWORLD_LLM_ENABLED",
+      mp{"env"}{"COWORLD_LLM_ENABLED"}.getStr() == "true")
+    check("model player declares COWORLD_LLM_MODEL",
+      mp{"env"}{"COWORLD_LLM_MODEL"}.getStr().len > 0)
+  check("baseline player is declared", byId.hasKey("baseline"))
+  if byId.hasKey("baseline"):
+    check("baseline is the shoal scripted opponent",
+      byId["baseline"]{"env"}{"PLAYER_SCRIPTED"}.getStr() == "shoal")
   # EVERY declared player entry must occupy at least one certification slot.
   var seated = initHashSet[string]()
   for seat in m{"certification"}{"players"}:
@@ -256,12 +268,13 @@ block certificationFixture:
     $cert{"players"}.len)
   check("certification.game_config.players names four seats",
     config{"players"}.len == 4, $config{"players"}.len)
-  check("every seat is the bundled baseline", (block:
-    var all = true
+  check("cert fixture seats model alongside explicit scripted baseline opponents", (block:
+    var models = 0
+    var baselines = 0
     for seat in cert{"players"}:
-      if seat{"player_id"}.getStr() != "baseline":
-        all = false
-    all))
+      if seat{"player_id"}.getStr() == "model": inc models
+      elif seat{"player_id"}.getStr() == "baseline": inc baselines
+    models >= 1 and baselines >= 1 and models + baselines == 4))
   check("the fixture pins a seed", config{"seed"}.getInt() > 0)
   check("the fixture is 720 ticks = 30.0 s of playback, longer than the " &
     "12 s viewer soak", config{"maxTicks"}.getInt() == 720,

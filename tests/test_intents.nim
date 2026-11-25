@@ -1,5 +1,6 @@
-## Tolerant parsing and repair, and the RUNE-boundary discipline that keeps a
-## replay readable by a strict UTF-8 parser.
+## Strict native action parsing (raw JSON or single code fence, no brace
+## scraping, no silent repair of unknown/invalid actions) and RUNE-boundary
+## discipline that keeps a replay readable by a strict UTF-8 parser.
 
 import std/[json, strutils, unicode]
 
@@ -16,90 +17,87 @@ proc parse(text: string, previous = defaultIntent(), have = false,
            own = 0): SkimmerIntent =
   parseIntent(extractJsonObject(text), previous, have, own)
 
-block prosePrefixed:
-  let intent = parse("""Sure! Here is my order:
-{"note":"F2 is close","mode":"hunt","target":"F2","throttle":1.0}
-Hope that helps.""")
-  check("prose-prefixed JSON parses", intent.mode == mHunt)
-  check("the target survives", intent.target == 1, $intent.target)
-  check("throttle 1.0 is full", intent.throttle255 == 255, $intent.throttle255)
+proc rejects(text: string, own = 0): bool =
+  try:
+    discard parse(text, own = own)
+    false
+  except IntentError:
+    true
 
-block fenced:
+block nativeJsonAndMinimalKeys:
+  let minimal = parse("""{"mode":"hold"}""")
+  check("minimal mode-only JSON parses without exhaustive keys", minimal.mode == mHold)
+  check("omitted note and say default empty", minimal.note == "" and minimal.say == "")
+  let hunt = parse("""{"mode":"hunt","target":"F2","throttle":0.8}""")
+  check("hunt with target and throttle parses",
+    hunt.mode == mHunt and hunt.target == 1 and hunt.throttle255 >= 200)
+
+block singleFenceAccepted:
   let intent = parse("```json\n{\"mode\":\"escort\",\"partner\":\"SKIM-3\"}\n```")
-  check("fenced JSON parses", intent.mode == mEscort)
+  check("single json code fence parses", intent.mode == mEscort)
   check("the partner alias resolves", intent.partner == 2, $intent.partner)
+  let bareFence = parse("```\n{\"mode\":\"avoid\"}\n```")
+  check("single bare code fence parses", bareFence.mode == mAvoid)
 
-block balancedBracesAndProse:
-  let withBracesAndTrailing = parse(
-    """{"note":"avoid {rock} and \"}\"","mode":"hunt","target":"F3","partner":"none"} trailing {junk}""")
-  check("braces inside quoted note + trailing {junk} parse cleanly",
-    withBracesAndTrailing.mode == mHunt and withBracesAndTrailing.target == 2 and
-      withBracesAndTrailing.partner == -1)
-  check("quoted braces inside note survive intact",
-    withBracesAndTrailing.note == """avoid {rock} and "}"""")
-  let strayLeadQuote = parse(
-    """2" sensor margin: {"mode":"hold","partner":"none","throttle":0.0} {extra}""")
-  check("an unmatched quote in leading prose does not corrupt brace scanning",
-    strayLeadQuote.mode == mHold and strayLeadQuote.throttle255 == 0)
-  let leadingProseBraces = parse(
-    """Draft {idea "A}: {"mode":"escort","partner":"SKIM-4","target":"none"}""")
-  check("non-JSON {prose} braces before the reply object are skipped",
-    leadingProseBraces.mode == mEscort and leadingProseBraces.partner == 3)
+block noBraceScrapingOrProse:
+  check("prose-prefixed JSON is rejected",
+    rejects("""Sure! Here is my order:
+{"mode":"hunt","target":"F2","throttle":1.0}"""))
+  check("trailing prose after JSON is rejected",
+    rejects("""{"mode":"hunt","target":"F3"} trailing text"""))
+  check("trailing junk object is rejected",
+    rejects("""{"mode":"hold"} {"mode":"avoid"}"""))
+  check("prose around code fence is rejected",
+    rejects("Here you go:\n```json\n{\"mode\":\"hold\"}\n```"))
+  check("text after code fence is rejected",
+    rejects("```json\n{\"mode\":\"hold\"}\n```\nDone."))
+  check("multiple code fences are rejected",
+    rejects("```json\n{\"mode\":\"hold\"}\n```\n```json\n{\"mode\":\"avoid\"}\n```"))
 
-block percentageThrottle:
-  let intent = parse("""{"mode":"sweep","throttle":70}""")
-  check("an integer percentage throttle is divided by 100",
-    intent.throttle255 >= 170 and intent.throttle255 <= 190, $intent.throttle255)
-
-block centimetres:
-  let intent = parse("""{"mode":"sweep","standoff_m":120,"waypoint":[300,200]}""")
-  check("a centimetre standoff becomes 1.2 m", intent.standoffMm == 1200,
-    $intent.standoffMm)
-  check("a centimetre waypoint x becomes 3.00 m",
-    abs(intent.waypointXUm - 3_000_000) < 20_000, $intent.waypointXUm)
-  check("a centimetre waypoint y becomes view 2.00 m (sim 6.00 m)",
-    abs(intent.waypointYUm - 6_000_000) < 20_000, $intent.waypointYUm)
-
-block waypointObject:
-  let intent = parse("""{"mode":"sweep","waypoint":{"x":9.0,"y":6.0}}""")
-  check("an {x,y} waypoint parses",
-    abs(intent.waypointXUm - 9_000_000) < 20_000, $intent.waypointXUm)
-  check("view y is flipped into sim y",
-    abs(intent.waypointYUm - 2_000_000) < 20_000, $intent.waypointYUm)
-
-block targetSpellings:
-  check("plankton F2 parses", parse("""{"target":"plankton F2"}""").target == 1)
-  check("the RECORDED target is canonical and inside its 4-rune cap", (block:
-    var intent = defaultIntent()
-    intent.target = 1
-    parseJson(intent.boundedIntentRecord(0, 0, 0)){"target"}.getStr().runeLen <= 4))
-  check("the RECORDED partner is canonical and inside its 8-rune cap", (block:
-    var intent = defaultIntent()
-    intent.partner = 3
-    parseJson(intent.boundedIntentRecord(0, 0, 0)){"partner"}.getStr().runeLen <= 8))
-  check("a bare number parses", parse("""{"target":"2"}""").target == 1)
-  check("an integer target parses", parse("""{"target":3}""").target == 2)
-  check("an out-of-set id is none", parse("""{"target":"F9"}""").target == -1)
-  check("none is none", parse("""{"target":"none"}""").target == -1)
-
-block unknownModeKeepsLast:
-  var previous = defaultIntent()
-  previous.mode = mEscort
-  check("an unknown mode keeps last turn's",
-    parse("""{"mode":"kamikaze"}""", previous, true).mode == mEscort)
-  check("an unknown mode with no history is sweep",
-    parse("""{"mode":"kamikaze"}""").mode == mSweep)
-
-block selfPartnerIsNone:
-  check("my own alias as partner is none",
-    parse("""{"partner":"SKIM-2"}""", own = 1).partner == -1)
+block strictFieldValidation:
+  check("unknown mode is rejected instead of repaired",
+    rejects("""{"mode":"kamikaze"}"""))
+  check("missing mode (note-only) is rejected",
+    rejects("""{"note":"just thinking"}"""))
+  check("non-string mode is rejected",
+    rejects("""{"mode":1}"""))
+  check("my own alias as partner is none per game rules",
+    parse("""{"mode":"escort","partner":"SKIM-2"}""", own = 1).partner == -1)
+  check("unknown partner alias is rejected",
+    rejects("""{"mode":"escort","partner":"SKIM-9"}""", own = 0))
   check("another skimmer's alias resolves",
-    parse("""{"partner":"SKIM-2"}""", own = 0).partner == 1)
+    parse("""{"mode":"escort","partner":"SKIM-2"}""", own = 0).partner == 1)
+  check("out-of-set target is rejected",
+    rejects("""{"mode":"hunt","target":"F9"}"""))
+  check("none target is -1",
+    parse("""{"mode":"hunt","target":"none"}""").target == -1)
+  check("string throttle shim is rejected",
+    rejects("""{"mode":"sweep","throttle":"0.5"}"""))
+  check("unparseable throttle is rejected",
+    rejects("""{"mode":"sweep","throttle":"abc"}"""))
+  check("non-finite lead_ticks string is rejected",
+    rejects("""{"mode":"hunt","lead_ticks":"NaN"}"""))
+  check("malformed waypoint is rejected",
+    rejects("""{"mode":"sweep","waypoint":[null,null]}"""))
+
+block waypointAndClamping:
+  let wpObj = parse("""{"mode":"sweep","waypoint":{"x":9.0,"y":6.0}}""")
+  check("an {x,y} waypoint parses",
+    abs(wpObj.waypointXUm - 9_000_000) < 20_000, $wpObj.waypointXUm)
+  check("view y is flipped into sim y",
+    abs(wpObj.waypointYUm - 2_000_000) < 20_000, $wpObj.waypointYUm)
+  let clamped = parse("""{"mode":"sweep","lead_ticks":9000,"standoff_m":5.0,"throttle":2.0,
+    "waypoint":[-40.0,900.0]}""")
+  check("lead_ticks clamps to 24", clamped.leadTicks == 24, $clamped.leadTicks)
+  check("standoff clamps to 2.5 m", clamped.standoffMm == MaxStandoffMm,
+    $clamped.standoffMm)
+  check("throttle clamps to full", clamped.throttle255 == 255, $clamped.throttle255)
+  check("the waypoint clamps into the tank",
+    clamped.waypointXUm >= WaypointMinUm and clamped.waypointXUm <= WaypointMaxXUm and
+      clamped.waypointYUm >= WaypointMinUm and clamped.waypointYUm <= WaypointMaxYUm,
+    $clamped.waypointXUm & "," & $clamped.waypointYUm)
 
 block undetectedTarget:
-  ## A target the seat cannot sense is `none` to the CONTROLLER, which then
-  ## takes the nearest plankton it can actually sense. The parser keeps the id
-  ## (it is in range); the controller's fallback is what makes it harmless.
   var sim = seatedSim()
   for f in 0 ..< FoodCount:
     sim.food[f].state = psRespawning
@@ -107,48 +105,20 @@ block undetectedTarget:
   check("an undetected plankton is not in the sensor frame",
     frame.foodDetection(1) < 0)
 
-block nonFiniteAndAbsent:
-  let intent = parse("""{"mode":"hunt","lead_ticks":"NaN","standoff_m":null,
-    "throttle":"abc","waypoint":[null,null]}""")
-  check("a non-finite lead falls back to 6", intent.leadTicks == 6,
-    $intent.leadTicks)
-  check("a null standoff falls back to 1.2 m", intent.standoffMm == 1200,
-    $intent.standoffMm)
-  check("an unparseable throttle falls back to full", intent.throttle255 == 255,
-    $intent.throttle255)
-
-block outOfRangeClamps:
-  # NB 50.0 and 9.5 would be read as CENTIMETRES and a PERCENTAGE by the
-  # documented tolerances, so the out-of-range case uses values those rules
-  # cannot claim: 5.0 m of standoff and 150 % of throttle.
-  let intent = parse("""{"lead_ticks":9000,"standoff_m":5.0,"throttle":150,
-    "waypoint":[-40.0,900.0]}""")
-  check("lead_ticks clamps to 24", intent.leadTicks == 24, $intent.leadTicks)
-  check("standoff clamps to 2.5 m", intent.standoffMm == MaxStandoffMm,
-    $intent.standoffMm)
-  check("throttle clamps to full", intent.throttle255 == 255, $intent.throttle255)
-  check("the waypoint clamps into the tank",
-    intent.waypointXUm >= WaypointMinUm and intent.waypointXUm <= WaypointMaxXUm and
-      intent.waypointYUm >= WaypointMinUm and intent.waypointYUm <= WaypointMaxYUm,
-    $intent.waypointXUm & "," & $intent.waypointYUm)
-
 block noteCap:
   var long = ""
   for _ in 0 ..< 300:
     long.add("x")
-  let intent = parse("""{"note":"""" & long & """"}""")
+  let intent = parse("""{"mode":"hold","note":"""" & long & """"}""")
   check("a 300-character note is cut to 160 runes",
     intent.note.runeLen == MaxNoteRunes, $intent.note.runeLen)
 
 block runeBoundaryEmoji:
-  ## The scar this rule exists for: a `say` whose 48th and 49th characters are a
-  ## 4-BYTE EMOJI. The cut must land on the RUNE boundary and the result must
-  ## still round-trip through a strict UTF-8 JSON parser.
   var text = ""
   for _ in 0 ..< 47:
     text.add("a")
-  text.add("\u{1F41F}")     ## 4-byte fish: rune 48
-  text.add("\u{1F41F}")     ## rune 49, must be cut
+  text.add("\u{1F41F}")
+  text.add("\u{1F41F}")
   check("the input really is 49 runes", text.runeLen == 49, $text.runeLen)
   let truncated = text.truncateRunes(MaxSayRunes)
   check("truncation lands on 48 runes", truncated.runeLen == 48,
@@ -159,7 +129,6 @@ block runeBoundaryEmoji:
   check("the truncated string round-trips through parseJson",
     parseJson(record){"say"}.getStr() == truncated)
   check("the serialized record is valid UTF-8", record.validateUtf8() == -1)
-  # And through the full sanitiser, which is what actually reaches the replay.
   let sanitized = sanitizeSay(text)
   check("sanitizeSay never emits a partial codepoint",
     sanitized.validateUtf8() == -1)
@@ -175,18 +144,8 @@ block runeBoundaryEmoji:
     mixed.validateUtf8() == -1 and "\u{1F41F}" notin mixed, mixed)
 
 block noUsableField:
-  var raised = false
-  try:
-    discard parse("""{"unrelated":1}""")
-  except IntentError:
-    raised = true
-  check("a reply with no usable field raises", raised)
-  var raisedNoJson = false
-  try:
-    discard parse("I would rather not.")
-  except IntentError:
-    raisedNoJson = true
-  check("a reply with no JSON object at all raises", raisedNoJson)
+  check("a reply with no mode raises", rejects("""{"unrelated":1}"""))
+  check("a reply with no JSON object at all raises", rejects("I would rather not."))
 
 block recordCaps:
   var intent = defaultIntent()
