@@ -388,7 +388,7 @@ proc turn*(
       for seat in 0 ..< sim.seatCount():
         if engine.seats[seat].isLlm:
           engine.trajectory.recordDecision($turnIndex & "-" & $seat, $seat,
-            observations[seat], @[], none(string), newJNull(), asFallback,
+            observations[seat], @[], none(string), newJNull(), asMissing,
             fallbackOrigin = none(string))
     return result
 
@@ -483,7 +483,7 @@ proc turn*(
       if failedSeat:
         engine.trajectory.recordDecision($turnIndex & "-" & $seat, $seat,
           observations[seat], attempts[seat], none(string), newJNull(),
-          asFallback, fallbackOrigin = none(string))
+          asRejected, fallbackOrigin = none(string))
         continue
       let intent = engine.intents[seat]
       let action = intent.intentRecord(turnIndex, seat, sim.skimmerForSeat(seat))

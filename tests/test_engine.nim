@@ -8,7 +8,7 @@ import std/[atomics, json, monotimes, net, os, strutils, times]
 import mummy
 
 import helpers
-import waterworld/[sim, roster, sensors, intents, control, baselines, decide, llm]
+import waterworld/[sim, roster, sensors, intents, control, baselines, decide, llm, capture]
 
 var failures = 0
 proc check(name: string, ok: bool, detail = "") =
@@ -314,8 +314,11 @@ block fakeProviderDrivesTheEngine:
         parseJson(record){"k"}.getStr() != "fallback", record)
 
   block invalidReplyFailsOnceNoRetryAndPreservesRaw:
+    engine.trajectory = newDecisionTrajectory(
+      "ep-test-rejected", "waterworld-test", "walker-waterworld", "0.1.7", "test-rev")
     fakeReset(fmGarbage)
     let records = engine.turn(sim, sim.framesFor(), 1, 0)
+    engine.trajectory = nil
     check("an unusable reply issues exactly one batch with no retries",
       fakeSeen.load(moSequentiallyConsistent) == SkimmerCount,
       $fakeSeen.load(moSequentiallyConsistent))

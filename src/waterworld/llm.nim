@@ -278,7 +278,7 @@ backs off poison for you. You choose WHAT to go for and HOW hard.
 """
 
 const OutputFormat = """
-Reply with a single JSON object (optionally inside one ```json code fence) and nothing else.
+Reply with ONLY a single JSON object starting with '{' and ending with '}' — no markdown, no explanation, no extra text.
 Required key: "mode" ("hunt" | "escort" | "sweep" | "hold" | "avoid").
 Optional keys: "target" ("F1".."F5" | "none"), "partner" ("SKIM-1".."SKIM-4" | "none"), "waypoint" ([x, y] in metres), "lead_ticks" (0..24), "standoff_m" (0.0..2.5), "throttle" (0.0..1.0), "note" (<=160 chars), "say" (<=48 chars).
 - "hunt": steer toward "target" (or nearest sensed plankton, else "waypoint"), leading by "lead_ticks".
