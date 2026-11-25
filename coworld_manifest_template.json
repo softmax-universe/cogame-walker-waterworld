@@ -331,7 +331,7 @@
       "turnBudgetMs": 16000,
       "turnSpacingMs": 0,
       "wallClockBudgetSeconds": 180,
-      "lobbyJoinTimeoutTicks": 720,
+      "lobbyJoinTimeoutTicks": 1728,
       "captureTarget": 20,
       "fastMode": true
     }

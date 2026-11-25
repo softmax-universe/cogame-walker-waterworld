@@ -885,5 +885,6 @@ proc runServerLoop*(
       joinThread(serverThread)
       break
 
-    runFrameLimiter(lastTick, not replayLoaded and config.fastMode,
+    runFrameLimiter(lastTick,
+      not replayLoaded and config.fastMode and sim.phase != Lobby,
       sockets, playerIndices, SkimmerCount)
