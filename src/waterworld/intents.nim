@@ -101,117 +101,98 @@ proc defaultIntent*(): SkimmerIntent =
     throttle255: DefaultThrottle255,
     say: "", source: isScripted, latencyMs: 0)
 
-proc parseMode*(text: string, fallback: Mode): Mode =
-  ## Tolerant: case-insensitive, hyphens and spaces normalised to underscores.
-  ## Anything still unknown keeps the caller's fallback (last turn's mode, else
-  ## `sweep`).
-  let key = text.strip().toLowerAscii().replace("-", "_").replace(" ", "_")
+proc parseMode*(text: string): Mode =
+  ## Strict lookup against the five native modes. Unknown or empty mode raises
+  ## `IntentError` rather than silently substituting another action.
+  let key = text.strip().toLowerAscii()
   for mode in Mode:
     if $mode == key:
       return mode
-  fallback
+  raise newException(IntentError, "unknown mode: " & text.truncateRunes(64))
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## The first valid balanced `{...}` JSON object in a model reply, tracking
-  ## strings and escapes inside each `{...}` candidate so markdown fences,
-  ## stray quotes, or extra `{...}` fragments in surrounding prose cannot
-  ## corrupt extraction.
-  for start in 0 ..< text.len:
-    if text[start] != '{':
-      continue
-    var
-      depth = 0
-      inString = false
-      escaped = false
-    for i in start ..< text.len:
-      let ch = text[i]
-      if inString:
-        if escaped: escaped = false
-        elif ch == '\\': escaped = true
-        elif ch == '"': inString = false
-        continue
-      case ch
-      of '"': inString = true
-      of '{': inc depth
-      of '}':
-        dec depth
-        if depth == 0:
-          try:
-            let node = parseJson(text[start .. i])
-            if node.kind == JObject:
-              return node
-          except CatchableError:
-            discard
-          break
-      else: discard
-  var head = text.strip()
-  if head.runeLen > 160:
-    head = head.truncateRunes(160) & "..."
-  raise newException(IntentError,
-    "no JSON object in reply: " & head.replace("\n", " "))
+  ## Accepts either a single raw JSON object or a single markdown code fence
+  ## wrapping one JSON object. Does NOT scrape `{...}` out of surrounding prose.
+  let trimmed = text.strip()
+  var body = trimmed
+  if trimmed.startsWith("```"):
+    let firstNl = trimmed.find('\n')
+    if firstNl < 0:
+      raise newException(IntentError, "unterminated code fence in reply")
+    let header = trimmed[3 ..< firstNl].strip().toLowerAscii()
+    if header.len > 0 and header != "json":
+      raise newException(IntentError, "unsupported code fence language: " & header)
+    let rest = trimmed[firstNl + 1 .. ^1]
+    let closeIdx = rest.find("```")
+    if closeIdx < 0:
+      raise newException(IntentError, "missing closing code fence in reply")
+    let afterClose = rest[closeIdx + 3 .. ^1].strip()
+    if afterClose.len > 0:
+      raise newException(IntentError, "unexpected text after closing code fence")
+    body = rest[0 ..< closeIdx].strip()
+  if body.len < 2 or body[0] != '{' or body[^1] != '}':
+    var head = trimmed
+    if head.runeLen > 160:
+      head = head.truncateRunes(160) & "..."
+    raise newException(IntentError,
+      "reply must be a single JSON object (optionally in one code fence): " &
+        head.replace("\n", " "))
+  try:
+    let node = parseJson(body)
+    if node.kind != JObject:
+      raise newException(IntentError, "reply JSON must be an object")
+    return node
+  except IntentError:
+    raise
+  except CatchableError as error:
+    raise newException(IntentError, "invalid JSON object: " & error.msg)
 
-proc readNumber(node: JsonNode): tuple[ok: bool, value: float] =
-  ## One numeric field: an int, a float, or a numeric string. Non-finite or
-  ## unparseable reports `ok = false` so the caller applies its documented
-  ## default rather than inventing a value.
+proc readStrictNumber(node: JsonNode, field: string): float =
+  ## One numeric field: a finite JSON int or float. No string/unit coercion.
   if node.isNil:
-    return (false, 0.0)
+    raise newException(IntentError, field & " must be a number")
   case node.kind
   of JInt:
-    (true, float(node.getBiggestInt()))
+    float(node.getBiggestInt())
   of JFloat:
     let f = node.getFloat()
-    if f != f or f > 1.0e12 or f < -1.0e12: (false, 0.0) else: (true, f)
-  of JString:
-    let raw = node.getStr().strip().strip(chars = {'%', ' '})
-    try:
-      let f = parseFloat(raw)
-      if f != f: (false, 0.0) else: (true, f)
-    except CatchableError:
-      (false, 0.0)
+    if f != f or f > 1.0e12 or f < -1.0e12:
+      raise newException(IntentError, field & " must be a finite number")
+    f
   else:
-    (false, 0.0)
+    raise newException(IntentError, field & " must be a JSON number")
 
 proc parseTargetId*(text: string): int32 =
-  ## `"F2"`, `"f2"`, `"plankton F2"`, `"2"` and `"none"` all parse. Anything
-  ## outside F1..F5 is `none`, which makes the controller take the nearest
-  ## plankton it can actually sense.
+  ## Parses `"F1".."F5"` or `"none"` (case-insensitive). Unknown target raises
+  ## `IntentError`.
   let raw = text.strip().toLowerAscii()
-  if raw.len == 0 or raw == "none" or raw == "null":
+  if raw.len == 0 or raw == "none":
     return -1
-  var digits = ""
-  for ch in raw:
-    if ch in {'0' .. '9'}:
-      digits.add(ch)
-  if digits.len == 0:
-    return -1
-  try:
-    let value = parseInt(digits)
-    if value >= 1 and value <= FoodCount:
-      return int32(value - 1)
-  except ValueError:
-    discard
-  -1
+  if raw.len >= 2 and raw[0] == 'f':
+    try:
+      let value = parseInt(raw[1 .. ^1])
+      if value >= 1 and value <= FoodCount:
+        return int32(value - 1)
+    except ValueError:
+      discard
+  raise newException(IntentError, "invalid target: " & text.truncateRunes(64))
 
 proc parsePartnerAlias*(text: string, ownSkimmer: int): int32 =
-  ## `"SKIM-2"`, `"skim2"`, `"2"` and `"none"` all parse. My OWN alias is
-  ## `none` — a skimmer cannot escort itself — and so is anything unrecognised.
+  ## Parses `"SKIM-1".."SKIM-4"` or `"none"` (case-insensitive). Naming your own
+  ## alias is `"none"` per the game rules; an unknown alias raises `IntentError`.
   let raw = text.strip().toLowerAscii()
-  if raw.len == 0 or raw == "none" or raw == "null":
+  if raw.len == 0 or raw == "none":
     return -1
-  var digits = ""
-  for ch in raw:
-    if ch in {'0' .. '9'}:
-      digits.add(ch)
-  if digits.len == 0:
-    return -1
-  try:
-    let value = parseInt(digits)
-    if value >= 1 and value <= SkimmerCount and value - 1 != ownSkimmer:
-      return int32(value - 1)
-  except ValueError:
-    discard
-  -1
+  if raw.startsWith("skim-"):
+    try:
+      let value = parseInt(raw[5 .. ^1])
+      if value >= 1 and value <= SkimmerCount:
+        if value - 1 == ownSkimmer:
+          return -1
+        return int32(value - 1)
+    except ValueError:
+      discard
+  raise newException(IntentError, "invalid partner: " & text.truncateRunes(64))
 
 proc parseIntent*(
   payload: JsonNode,
@@ -219,114 +200,70 @@ proc parseIntent*(
   havePrevious: bool,
   ownSkimmer: int
 ): SkimmerIntent =
-  ## Turns one parsed reply into a legal intent, REPAIRING every field the
-  ## schema bounds rather than rejecting the reply. Raises `IntentError` only
-  ## when NO usable field can be recovered — the one condition the retry and
-  ## then the scripted fallback exist for.
-  ##
-  ## Tolerances, all of them things models actually emit: markdown fences and
-  ## prose (handled by `extractJsonObject`), numeric strings, an integer
-  ## PERCENTAGE for `throttle` (divided by 100 above 1), CENTIMETRES for
-  ## `standoff_m` and the waypoint (divided by 100 above 30), `waypoint` as
-  ## `{"x":…,"y":…}` as well as `[x, y]`, and case-insensitive enums.
+  ## Turns one parsed reply into a legal intent. Requires a valid `"mode"`; all
+  ## other fields are optional and default cleanly when omitted or null. Invalid
+  ## types or values raise `IntentError` rather than silently substituting.
   if payload.isNil or payload.kind != JObject:
     raise newException(IntentError, "reply is not a JSON object")
-  result = if havePrevious: previous else: defaultIntent()
+  if not payload.hasKey("mode") or payload["mode"].kind != JString:
+    raise newException(IntentError, "reply must include string field \"mode\"")
+
+  result = defaultIntent()
+  if havePrevious:
+    result.waypointXUm = previous.waypointXUm
+    result.waypointYUm = previous.waypointYUm
   result.source = isLlm
   result.latencyMs = 0
-  var usable = 0
+  result.mode = parseMode(payload["mode"].getStr())
 
-  if payload.hasKey("note"):
-    result.note = sanitizeNote(payload{"note"}.getStr())
-    inc usable
-  if payload.hasKey("say"):
-    result.say = sanitizeSay(payload{"say"}.getStr())
-    inc usable
+  if payload.hasKey("note") and payload["note"].kind != JNull:
+    if payload["note"].kind != JString:
+      raise newException(IntentError, "note must be a string")
+    result.note = sanitizeNote(payload["note"].getStr())
 
-  if payload.hasKey("mode"):
-    let fallback = if havePrevious: previous.mode else: mSweep
-    result.mode = parseMode(payload{"mode"}.getStr(), fallback)
-    inc usable
+  if payload.hasKey("say") and payload["say"].kind != JNull:
+    if payload["say"].kind != JString:
+      raise newException(IntentError, "say must be a string")
+    result.say = sanitizeSay(payload["say"].getStr())
 
-  if payload.hasKey("target"):
-    # The <= 4-rune cap is on what is RECORDED, and the recorded value is
-    # canonical (`F1`..`F5` or `none`) by construction — so the reply's own
-    # spelling is parsed in full. Capping first would turn "plankton F2" into
-    # "plan" and lose a target the model really named.
-    let node = payload{"target"}
-    let text =
-      if node.kind == JString: node.getStr()
-      elif node.kind == JInt: $node.getBiggestInt()
-      else: "none"
-    result.target = parseTargetId(text)
-    inc usable
+  if payload.hasKey("target") and payload["target"].kind != JNull:
+    if payload["target"].kind != JString:
+      raise newException(IntentError, "target must be a string")
+    result.target = parseTargetId(payload["target"].getStr())
 
-  if payload.hasKey("partner"):
-    let node = payload{"partner"}
-    let text =
-      if node.kind == JString: node.getStr()
-      elif node.kind == JInt: $node.getBiggestInt()
-      else: "none"
-    result.partner = parsePartnerAlias(text, ownSkimmer)
-    inc usable
+  if payload.hasKey("partner") and payload["partner"].kind != JNull:
+    if payload["partner"].kind != JString:
+      raise newException(IntentError, "partner must be a string")
+    result.partner = parsePartnerAlias(payload["partner"].getStr(), ownSkimmer)
 
-  if payload.hasKey("waypoint"):
-    let node = payload{"waypoint"}
-    var
-      rx = (ok: false, value: 0.0)
-      ry = (ok: false, value: 0.0)
-    if not node.isNil and node.kind == JArray and node.len >= 2:
-      rx = readNumber(node[0])
-      ry = readNumber(node[1])
-    elif not node.isNil and node.kind == JObject:
-      rx = readNumber(node{"x"})
-      ry = readNumber(node{"y"})
-    if rx.ok and ry.ok:
-      var
-        wx = rx.value
-        wy = ry.value
-      # Centimetres, not metres: nothing in a 12 x 8 m tank is at 350.
-      if wx > 30.0 or wy > 30.0:
-        wx = wx / 100.0
-        wy = wy / 100.0
-      # View metres (origin bottom-left, y up) -> sim µm (origin top-left, y down).
-      result.waypointXUm = int32(clamp(wx * 1_000_000.0,
-        float(WaypointMinUm), float(WaypointMaxXUm)))
-      result.waypointYUm = int32(clamp(float(ArenaH) - wy * 1_000_000.0,
-        float(WaypointMinUm), float(WaypointMaxYUm)))
-      inc usable
-
-  if payload.hasKey("lead_ticks"):
-    let read = readNumber(payload{"lead_ticks"})
-    result.leadTicks =
-      if read.ok: int32(clamp(read.value + 0.5, 0.0, float(MaxLeadTicks)))
-      else: DefaultLeadTicks
-    inc usable
-
-  if payload.hasKey("standoff_m"):
-    let read = readNumber(payload{"standoff_m"})
-    if read.ok:
-      var metres = read.value
-      if metres > 30.0:                     ## centimetres
-        metres = metres / 100.0
-      result.standoffMm = int32(clamp(metres * 1000.0, 0.0, float(MaxStandoffMm)))
+  if payload.hasKey("waypoint") and payload["waypoint"].kind != JNull:
+    let node = payload["waypoint"]
+    var wx, wy: float
+    if node.kind == JArray and node.len == 2:
+      wx = readStrictNumber(node[0], "waypoint[0]")
+      wy = readStrictNumber(node[1], "waypoint[1]")
+    elif node.kind == JObject and node.hasKey("x") and node.hasKey("y"):
+      wx = readStrictNumber(node["x"], "waypoint.x")
+      wy = readStrictNumber(node["y"], "waypoint.y")
     else:
-      result.standoffMm = DefaultStandoffMm
-    inc usable
+      raise newException(IntentError, "waypoint must be [x, y]")
+    # View metres (origin bottom-left, y up) -> sim µm (origin top-left, y down).
+    result.waypointXUm = int32(clamp(wx * 1_000_000.0,
+      float(WaypointMinUm), float(WaypointMaxXUm)))
+    result.waypointYUm = int32(clamp(float(ArenaH) - wy * 1_000_000.0,
+      float(WaypointMinUm), float(WaypointMaxYUm)))
 
-  if payload.hasKey("throttle"):
-    let read = readNumber(payload{"throttle"})
-    if read.ok:
-      var fraction = read.value
-      if fraction > 1.0:                    ## an integer percentage
-        fraction = fraction / 100.0
-      result.throttle255 = int32(clamp(fraction * 255.0, 0.0, 255.0))
-    else:
-      result.throttle255 = DefaultThrottle255
-    inc usable
+  if payload.hasKey("lead_ticks") and payload["lead_ticks"].kind != JNull:
+    let val = readStrictNumber(payload["lead_ticks"], "lead_ticks")
+    result.leadTicks = int32(clamp(val + 0.5, 0.0, float(MaxLeadTicks)))
 
-  if usable == 0:
-    raise newException(IntentError, "reply carried no usable intent field")
+  if payload.hasKey("standoff_m") and payload["standoff_m"].kind != JNull:
+    let metres = readStrictNumber(payload["standoff_m"], "standoff_m")
+    result.standoffMm = int32(clamp(metres * 1000.0, 0.0, float(MaxStandoffMm)))
+
+  if payload.hasKey("throttle") and payload["throttle"].kind != JNull:
+    let fraction = readStrictNumber(payload["throttle"], "throttle")
+    result.throttle255 = int32(clamp(fraction * 255.0, 0.0, 255.0))
 
 proc throttleFraction*(intent: SkimmerIntent): float {.inline.} =
   float(intent.throttle255) / 255.0

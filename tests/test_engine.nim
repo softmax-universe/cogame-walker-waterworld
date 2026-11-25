@@ -64,7 +64,7 @@ block oneParallelBatchPerTurn:
   check("the retry batch tells the model why",
     "not usable" in retryBodies[0])
 
-block noCredentialsFallsBackInstantly:
+block noCredentialsFailsInconclusive:
   var sim = seatedSim()
   var engine = initDecisionEngine(sim, PromptSelection())
   for seat in 0 ..< SkimmerCount:
@@ -75,21 +75,16 @@ block noCredentialsFallsBackInstantly:
   let records = engine.turn(sim, sim.framesFor(), 0, 0)
   let elapsed = (getMonoTime() - started).inMilliseconds.int
   check("a credential-less turn costs no network wait", elapsed < 1000, $elapsed)
-  check("every LLM seat recorded a fallback", records.len >= SkimmerCount,
+  check("every LLM seat recorded a failure", records.len >= SkimmerCount,
     $records.len)
-  var causes = 0
-  for record in records:
-    let node = parseJson(record)
-    if node{"k"}.getStr() == "fallback" and
-        node{"cause"}.getStr() == "no_credentials":
-      inc causes
-  check("the cause is named no_credentials", causes == SkimmerCount, $causes)
+  check("terminal failure is declared inconclusive",
+    engine.lastFailure.failed and
+      engine.lastFailure.kind == "episode_inconclusive" and
+      engine.lastFailure.cause == "no_credentials",
+    $engine.lastFailure)
   for seat in 0 ..< SkimmerCount:
-    check("every seat still has an intent", engine.haveIntent[seat])
-    check("the fallback intent is marked as a fallback",
-      engine.intents[seat].source == isFallback)
-    check("the fallback intent is neutral hold with zero throttle, not scripted shoal",
-      engine.intents[seat].mode == mHold and engine.intents[seat].throttle255 == 0)
+    check("no substitute intent is installed on failure",
+      not engine.haveIntent[seat])
 
 block scriptedSeatsGetNoFallbackRecord:
   var sim = seatedSim()
@@ -97,15 +92,12 @@ block scriptedSeatsGetNoFallbackRecord:
   let records = engine.turn(sim, sim.framesFor(), 0, 0)
   check("a seat that registered as SCRIPTED writes no fallback record",
     records.len == 0, $records.len)
+  check("scripted turn succeeds with no failure", not engine.lastFailure.failed)
   for seat in 0 ..< SkimmerCount:
     check("a scripted seat's intent is marked scripted",
       engine.intents[seat].source == isScripted)
 
 block budgetGuard:
-  ## The guard settles EARLY rather than overrun: if two more full turns
-  ## (spacing included) would not fit inside the engine's own wall-clock stop,
-  ## the LLM goes off for the rest of the episode and the run finishes on the
-  ## scripted layer, so the episode ends complete/* rather than deadline.
   var sim = seatedSim()
   var engine = initDecisionEngine(sim, PromptSelection())
   for seat in 0 ..< SkimmerCount:
@@ -118,12 +110,12 @@ block budgetGuard:
     if parseJson(record){"k"}.getStr() == "budget_guard":
       guarded = true
   check("the budget guard fires near the stop", guarded)
-  check("the LLM is off for the rest of the episode", engine.llmOff)
-  # And the episode still reaches a normal ending on the scripted layer.
-  let run = sim.runScripted(blShoal)
-  check("the guarded episode still ends complete/*",
-    sim.endReason == ReasonComplete, sim.endReason & "/" & sim.endRule)
-  check("the guarded episode played its ticks", run.ticks > 100, $run.ticks)
+  check("the LLM is off", engine.llmOff)
+  check("budget guard ends LLM turn inconclusive without substituting",
+    engine.lastFailure.failed and
+      engine.lastFailure.kind == "episode_inconclusive" and
+      engine.lastFailure.cause == "budget_guard",
+    $engine.lastFailure)
 
 block interBatchFloor:
   ## The rate floor is a bounded, measurable sleep: with turnSpacingMs set, two
@@ -194,9 +186,10 @@ block deadlineArithmetic:
 # ---------------------------------------------------------------------------
 type FakeMode = enum
   fmGood,          ## every reply parses
-  fmGarbageThenGood,  ## the first batch is unusable, the second parses
-  fmGarbage,       ## every reply is unusable
+  fmGarbage,       ## every reply is unusable prose
+  fmInvalidModel,  ## provider rejects invalid model with 400
   fmThrottled,     ## every reply is a 429
+  fmServerError,   ## every reply is a 503
   fmHung           ## every reply arrives long after the deadline
 
 var
@@ -235,16 +228,14 @@ proc fakeHandler(request: Request) {.gcsafe.} =
   of fmGood:
     request.respond(200, headers, replyBody(
       """{"mode":"hunt","target":"F1","throttle":0.5,"note":"fake"}"""))
-  of fmGarbageThenGood:
-    if ordinal <= SkimmerCount:
-      request.respond(200, headers, replyBody("no json here at all"))
-    else:
-      request.respond(200, headers, replyBody(
-        """{"mode":"escort","partner":"SKIM-2","throttle":0.25}"""))
   of fmGarbage:
-    request.respond(200, headers, replyBody("no json here at all"))
+    request.respond(200, headers, replyBody("ambiguous prose no json here"))
+  of fmInvalidModel:
+    request.respond(400, headers, """{"error":"unknown model: bad/model"}""")
   of fmThrottled:
     request.respond(429, headers, """{"message":"too many requests"}""")
+  of fmServerError:
+    request.respond(503, headers, """{"message":"service unavailable"}""")
   of fmHung:
     sleep(4000)
     request.respond(200, headers, replyBody("""{"mode":"hold"}"""))
@@ -322,79 +313,76 @@ block fakeProviderDrivesTheEngine:
       check("a good turn records no fallback",
         parseJson(record){"k"}.getStr() != "fallback", record)
 
-  block exactlyOneRetry:
-    fakeReset(fmGarbageThenGood)
-    let records = engine.turn(sim, sim.framesFor(), 1, 0)
-    check("an unusable first batch costs exactly one retry",
-      fakeSeen.load(moSequentiallyConsistent) == 2 * SkimmerCount, $fakeSeen.load(moSequentiallyConsistent))
-    for seat in 0 ..< SkimmerCount:
-      check("the retry's answer is the one that flies",
-        engine.intents[seat].source == isLlm and
-          engine.intents[seat].mode == mEscort)
-    var attemptOneFallbacks = 0
-    for record in records:
-      let node = parseJson(record)
-      if node{"k"}.getStr() == "fallback":
-        check("the attempt-1 failure is recorded as attempt 1",
-          node{"attempt"}.getInt() == 1, record)
-        check("and named a parse_error",
-          node{"cause"}.getStr() == "parse_error", record)
-        inc attemptOneFallbacks
-    check("one per seat", attemptOneFallbacks == SkimmerCount,
-      $attemptOneFallbacks)
-
-  block twoFailuresLandOnShoal:
+  block invalidReplyFailsOnceNoRetryAndPreservesRaw:
     fakeReset(fmGarbage)
-    let records = engine.turn(sim, sim.framesFor(), 2, 0)
-    check("two unusable batches are two batches and no more",
-      fakeSeen.load(moSequentiallyConsistent) == 2 * SkimmerCount, $fakeSeen.load(moSequentiallyConsistent))
-    for seat in 0 ..< SkimmerCount:
-      check("the seat lands on neutral hold fallback",
-        engine.intents[seat].source == isFallback and
-          engine.intents[seat].mode == mHold and
-          engine.intents[seat].throttle255 == 0)
-    var terminal = 0
-    for record in records:
-      let node = parseJson(record)
-      if node{"detail"}.getStr() == "seat fell back to neutral hold":
-        check("the terminal record says both attempts were spent",
-          node{"attempt"}.getInt() == 2, record)
-        inc terminal
-    check("with one terminal fallback record per seat",
-      terminal == SkimmerCount, $terminal)
+    let records = engine.turn(sim, sim.framesFor(), 1, 0)
+    check("an unusable reply issues exactly one batch with no retries",
+      fakeSeen.load(moSequentiallyConsistent) == SkimmerCount,
+      $fakeSeen.load(moSequentiallyConsistent))
+    check("invalid output is player_error parse_error",
+      engine.lastFailure.failed and
+        engine.lastFailure.kind == "player_error" and
+        engine.lastFailure.cause == "parse_error",
+      $engine.lastFailure)
+    check("raw output is preserved in lastFailure",
+      "ambiguous prose no json here" in engine.lastFailure.rawOutput and
+        "ambiguous prose no json here" in engine.lastFailure.message,
+      engine.lastFailure.message)
+    check("failure record written for partial replay", records.len >= SkimmerCount)
 
-  block throttledMeansNoRetry:
+  block invalidModelFailsAsPlayerError:
+    fakeReset(fmInvalidModel)
+    discard engine.turn(sim, sim.framesFor(), 2, 0)
+    check("invalid model costs zero retries",
+      fakeSeen.load(moSequentiallyConsistent) == SkimmerCount,
+      $fakeSeen.load(moSequentiallyConsistent))
+    check("invalid model is player_error invalid_model",
+      engine.lastFailure.failed and
+        engine.lastFailure.kind == "player_error" and
+        engine.lastFailure.cause == "invalid_model",
+      $engine.lastFailure)
+
+  block throttledMeansInconclusiveNoRetry:
     fakeReset(fmThrottled)
     let records = engine.turn(sim, sim.framesFor(), 3, 0)
     check("a 429 costs ZERO retries",
-      fakeSeen.load(moSequentiallyConsistent) == SkimmerCount, $fakeSeen.load(moSequentiallyConsistent))
+      fakeSeen.load(moSequentiallyConsistent) == SkimmerCount,
+      $fakeSeen.load(moSequentiallyConsistent))
+    check("throttled is episode_inconclusive",
+      engine.lastFailure.failed and
+        engine.lastFailure.kind == "episode_inconclusive" and
+        engine.lastFailure.cause == "throttled",
+      $engine.lastFailure)
     var throttled = 0
     for record in records:
       let node = parseJson(record)
       if node{"k"}.getStr() == "fallback" and
           node{"cause"}.getStr() == "throttled":
         inc throttled
-    check("and every seat's fallback names the throttle",
+    check("every seat's failure record names the throttle",
       throttled >= SkimmerCount, $throttled)
-    for record in records:
-      let node = parseJson(record)
-      if node{"detail"}.getStr() == "seat fell back to the shoal intent":
-        check("the terminal record counts the ONE attempt that was made",
-          node{"attempt"}.getInt() == 1, record)
-    for seat in 0 ..< SkimmerCount:
-      check("the seat still has a legal intent",
-        engine.intents[seat].source == isFallback)
+
+  block serverErrorMeansInconclusive:
+    fakeReset(fmServerError)
+    discard engine.turn(sim, sim.framesFor(), 4, 0)
+    check("5xx is episode_inconclusive provider_error",
+      engine.lastFailure.failed and
+        engine.lastFailure.kind == "episode_inconclusive" and
+        engine.lastFailure.cause == "provider_error",
+      $engine.lastFailure)
 
   block theBudgetCutsOffAHungProvider:
     fakeReset(fmHung)
     let started = getMonoTime()
-    let records = engine.turn(sim, sim.framesFor(), 4, 0)
+    let records = engine.turn(sim, sim.framesFor(), 5, 0)
     let elapsed = (getMonoTime() - started).inMilliseconds.int
     check("a hung provider does not outlive the per-turn budget",
       elapsed <= sim.config.turnBudgetMs + 2000, $elapsed)
-    for seat in 0 ..< SkimmerCount:
-      check("and the seat plays the shoal intent",
-        engine.intents[seat].source == isFallback)
+    check("a hung provider fails inconclusive",
+      engine.lastFailure.failed and
+        engine.lastFailure.kind == "episode_inconclusive" and
+        engine.lastFailure.cause in ["timeout", "transport_error"],
+      $engine.lastFailure)
     var timeouts = 0
     for record in records:
       let node = parseJson(record)

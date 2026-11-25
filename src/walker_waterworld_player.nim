@@ -30,15 +30,18 @@ const
   ResendEveryFrames = 24     ## ~1 s of frames at 24 Hz.
   ReconnectAttempts = 6
 
-proc registrationBlob(prompt, scripted, policy: string): string =
+proc registrationBlob(prompt, scripted, policy, model: string, llmEnabled: bool): string =
   ## The one registration message. `scripted` is JSON null when the seat is an
   ## LLM seat, so the server can tell "no baseline named" from "shoal named
   ## explicitly".
   var node = %*{
     "type": "register",
     "prompt": prompt,
-    "policy": policy
+    "policy": policy,
+    "llm_enabled": llmEnabled
   }
+  if model.len > 0:
+    node["model"] = %model
   if scripted.len > 0:
     node["scripted"] = %scripted
   else:
@@ -59,16 +62,25 @@ when isMainModule:
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
   let
-    prompt = getEnv("PLAYER_PROMPT").strip()
     scripted = getEnv("PLAYER_SCRIPTED").strip()
+    llmEnabled = getEnv("COWORLD_LLM_ENABLED").strip().toLowerAscii() == "true"
+    model = getEnv("COWORLD_LLM_MODEL").strip()
+    rawPrompt = getEnv("PLAYER_PROMPT").strip()
+    prompt =
+      if rawPrompt.len > 0: rawPrompt
+      elif scripted.len == 0 and (llmEnabled or model.len > 0):
+        "Coordinate with your pod to catch drifting plankton together while avoiding poison."
+      else: ""
+    isLlm = scripted.len == 0 and (prompt.len > 0 or llmEnabled or model.len > 0)
     label = block:
       let explicit = getEnv("PLAYER_POLICY_LABEL").strip()
       if explicit.len > 0: explicit
-      elif prompt.len > 0: "prompt"
+      elif isLlm: "prompt"
       elif scripted.len > 0: scripted
       else: "shoal"
   echo "walker-waterworld player: kind=",
-    (if prompt.len > 0: "llm" else: "scripted"),
+    (if isLlm: "llm" else: "scripted"),
+    " model=", (if model.len > 0: model else: "(default)"),
     " baseline=", (if scripted.len > 0: scripted else: "shoal"),
     " label=", label
 
@@ -108,7 +120,7 @@ when isMainModule:
   while true:
     var sessionFrames = 0
     try:
-      socket.send(registrationBlob(prompt, scripted, label), BinaryMessage)
+      socket.send(registrationBlob(prompt, scripted, label, model, llmEnabled), BinaryMessage)
       var resends = 0
       while true:
         let received = socket.receiveMessage()
@@ -118,7 +130,7 @@ when isMainModule:
         if resends < RegistrationResends and
             sessionFrames mod ResendEveryFrames == 1:
           inc resends
-          socket.send(registrationBlob(prompt, scripted, label), BinaryMessage)
+          socket.send(registrationBlob(prompt, scripted, label, model, llmEnabled), BinaryMessage)
         socket.send(readyBlob(), BinaryMessage)
     except CatchableError as error:
       echo "walker-waterworld player: socket closed (", error.msg, ")"

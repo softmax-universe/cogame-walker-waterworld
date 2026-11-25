@@ -17,7 +17,7 @@ type
     seed*: int
 
 const
-  PromptBankVersion* = "walker-waterworld-rules-v3"
+  PromptBankVersion* = "walker-waterworld-rules-v4"
 
 proc promptSelection*(node: JsonNode): PromptSelection =
   if node.kind != JObject:
