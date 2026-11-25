@@ -74,7 +74,7 @@ def play(binary: Path, variant: str, wording: str, prompt_seed: int, seed: int) 
             assert system == systems[seat]
             # Rule wording may change throughout the briefing, but never the action contract.
             briefing, separator, schema = system.partition(
-                "Reply with a single JSON object"
+                "Reply with ONLY a single JSON object"
             )
             assert briefing and separator and schema
             observation["messages"][0]["content"] = separator + schema
